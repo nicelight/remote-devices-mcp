@@ -3,6 +3,7 @@
 # ==============================================================================
 param(
     [switch]$Quick,
+    [switch]$Pair,
     [string]$Mode = "tunnel",
     [string]$User = "",
     [string]$Token = "",
@@ -811,16 +812,28 @@ if (-not $ScriptDir -or -not (Test-Path "$ScriptDir\core\agent.py")) {
     if (!(Test-Path $OpsDir)) { New-Item -ItemType Directory -Path $OpsDir -Force | Out-Null }
     
     $files = @(
+        "core/__init__.py",
         "core/agent.py",
-        "core/server.py",
-        "core/mcp_tools.py",
-        "core/web_share.py",
+        "core/agent_harness.py",
+        "core/code_cache.py",
+        "core/device.py",
         "core/domain.py",
+        "core/hooks.py",
+        "core/mcp_tools.py",
+        "core/onboarding.py",
         "core/paths.py",
-        "core/vitals.py",
+        "core/policies.py",
+        "core/redact.py",
+        "core/rekey.py",
+        "core/schemas.py",
+        "core/server.py",
+        "core/subagents.py",
+        "core/termux.py",
+        "core/triggers.py",
         "core/updater.py",
         "core/version.py",
-        "core/__init__.py",
+        "core/vitals.py",
+        "core/web_share.py",
         "skills/orchestrator.md",
         "ops/windows/agent-watchdog.ps1",
         "ops/windows/run-hidden.vbs",
@@ -893,7 +906,9 @@ if ($Mode -eq "standalone") {
 
     Clear-Host
 
-if ($Lang -eq "ru") {
+if ($Pair) {
+    Print-McpBox "ChatGPT - private Server URL for $AssignedUser" $SseUrl "No authentication; one connector per device"
+} elseif ($Lang -eq "ru") {
     Write-Host ""
     $copyMsg = if ($Copied) { "[OK] ССЫЛКА СКОПИРОВАНА В БУФЕР ОБМЕНА! (Вставьте через Ctrl+V)" } else { "Скопируйте ссылку выше" }
     Print-McpBox "ССЫЛКА ЛОКАЛЬНОГО MCP-СЕРВЕРА (СКОПИРУЙТЕ):" $LocalUrl $copyMsg
@@ -961,6 +976,19 @@ $regPayloadObj = @{
 if (-not [string]::IsNullOrWhiteSpace($Token)) {
     $regPayloadObj.token = $Token
 }
+if ($Pair) {
+    Push-Location $ScriptDir
+    try {
+        & $pyExeOnly -m core.onboarding pair --gateway "https://$Gateway" --config-dir $ConfigDir --name $User
+        if ($LASTEXITCODE -ne 0) { exit 1 }
+        $paired = @{}
+        Get-Content "$ConfigDir\agent.env" | ForEach-Object {
+            if ($_ -match '^(MESH_[A-Z_]+)=(.*)$') { $paired[$Matches[1]] = $Matches[2] }
+        }
+        $response = @{ username=$paired.MESH_USER; token=$paired.MESH_TOKEN; link_key=$paired.MESH_LINK_KEY }
+        $response.sse_url = "https://$Gateway/mcp?user=$($paired.MESH_USER)&token=$($paired.MESH_LINK_KEY)"
+    } finally { Pop-Location }
+} else {
 $regPayload = $regPayloadObj | ConvertTo-Json
 # Registration is the one step that cannot be skipped or guessed: without a real
 # node name and token the agent can never connect. This used to run under
@@ -985,6 +1013,8 @@ try {
         Write-Host "    Nothing was installed: no config file and no autostart were created." -ForegroundColor Yellow
     }
     exit 1
+}
+
 }
 
 $AssignedUser = $response.username
@@ -1031,11 +1061,13 @@ if ($Lang -eq "ru") {
     Write-Host "[3/3] Configuring Windows background autostart..." -ForegroundColor Green
 }
 $envFile = "$ConfigDir\agent.env"
+if (-not $Pair) {
 @"
 MESH_GATEWAY=$Gateway
 MESH_USER=$AssignedUser
 MESH_TOKEN=$AssignedToken
 "@ | Out-File -FilePath $envFile -Encoding utf8
+}
 
 # agent.env carries only the legacy MESH_GATEWAY, which core/domain.py honours for
 # the tunnel but never for the links a node publishes. The domain file is what
@@ -1247,6 +1279,8 @@ if (Test-Path -LiteralPath $updaterScript) {
         }
         if ($updaterError) { Write-Host "    $updaterError" -ForegroundColor DarkYellow }
     }
+} elseif ($Pair) {
+    Write-Host "Managed build: automatic upstream updates are disabled."
 } elseif ($Lang -eq "ru") {
     Write-Host "[!] $updaterScript не найден: автоматического обновления у узла не будет." -ForegroundColor Yellow
 } else {
@@ -1255,6 +1289,15 @@ if (Test-Path -LiteralPath $updaterScript) {
 
 # Launch now
 Start-Process $pyExeOnly -ArgumentList "-u -m core.agent" -WorkingDirectory $ScriptDir -WindowStyle Hidden
+
+if ($Pair) {
+    Push-Location $ScriptDir
+    try {
+        & $pyExeOnly -m core.onboarding status --config-dir $ConfigDir
+        if ($LASTEXITCODE -ne 0) { exit 1 }
+    } finally { Pop-Location }
+    Write-Host "ChatGPT: add a separate connector for this device; choose No authentication."
+}
 
 Clear-Host
 
@@ -1281,6 +1324,8 @@ if ($Lang -eq "ru") {
 }
 
 # ------------------------------------------------------------------------------
+if ($Pair) { exit 0 }
+
 # Post-install check. An install that looks successful while the agent never
 # connects is what leaves a client with an opaque frontend error, so the node's
 # state is verified here and reported with the interpreter and the log to read.

@@ -1,0 +1,24 @@
+[Unit]
+Description=Remote Harness MCP Gateway (single worker)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=rhm-gateway
+Group=rhm-gateway
+WorkingDirectory=/opt/remote-harness-mcp
+EnvironmentFile=/etc/remote-harness-mcp/gateway.env
+ExecStart=/opt/remote-harness-mcp/.venv/bin/uvicorn gateway:app --host ${MESH_LISTEN_HOST} --port 8096 --workers 1 --ws-max-size 134217728 --no-access-log --timeout-graceful-shutdown 5
+Restart=always
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/rhm-gateway
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

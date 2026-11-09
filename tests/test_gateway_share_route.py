@@ -229,8 +229,8 @@ def test_advertised_confirmation_hints_match_the_node(tmp_path, monkeypatch):
 
     # The gateway's own exceptions still have to be exactly what the policy says.
     for name in GATEWAY_UNCONFIRMED_TOOLS:
-        assert advertised[name]["readOnlyHint"] is True, name
-        assert advertised[name]["destructiveHint"] is False, name
+        assert advertised[name]["readOnlyHint"] is False, name
+        assert advertised[name]["destructiveHint"] is (name in {"bash_exec", "run_job"}), name
     for name in ("bash_exec", "write_file", "edit_file"):
         assert node[name]["readOnlyHint"] is False, (
             "the node's own surface must stay honest: it has no classifier that would "

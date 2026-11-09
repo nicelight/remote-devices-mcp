@@ -253,9 +253,10 @@ def test_pairing_refuses_to_approve_without_admin_rights(monkeypatch):
     assert _registry() == {}
 
 
-def test_pairing_hands_the_credentials_out_exactly_once(monkeypatch):
+def test_pairing_issues_once_and_allows_same_device_to_retry(monkeypatch):
     monkeypatch.setattr(gateway, "ADMIN_TOKEN", "admin-secret")
-    code = _pair_start()["pair_code"]
+    started = _pair_start()
+    code = started["pair_code"]
     body = json.dumps({"username": "workstation"}).encode()
 
     approved = asyncio.run(gateway.device_pair_approve(_request(
@@ -264,15 +265,18 @@ def test_pairing_hands_the_credentials_out_exactly_once(monkeypatch):
     )))
     assert approved.status_code == 200
 
-    collected = asyncio.run(gateway.device_pair_status(_request(path_params={"code": code})))
+    collected = asyncio.run(gateway.device_pair_status(_request(path_params={"code": code}, headers={"X-Pair-Secret": started["device_secret"]})))
     credentials = json.loads(collected.body)
     assert credentials["status"] == "approved"
     assert credentials["username"] == "workstation"
     assert credentials["link_key"].startswith("lk_")
     assert credentials["token"] not in credentials["sse_url"]
 
-    again = asyncio.run(gateway.device_pair_status(_request(path_params={"code": code})))
-    assert again.status_code == 404
+    again = asyncio.run(gateway.device_pair_status(_request(path_params={"code": code}, headers={"X-Pair-Secret": started["device_secret"]})))
+    assert again.status_code == 200
+    assert json.loads(again.body) == credentials
+    stolen = asyncio.run(gateway.device_pair_status(_request(path_params={"code": code})))
+    assert stolen.status_code == 403
 
 
 def test_a_leaked_pair_code_is_not_enough_to_get_credentials():

@@ -15,6 +15,7 @@ GATEWAY=""
 USERNAME=""
 TOKEN=""
 DRY_RUN=false
+PAIR=false
 QUICK=false
 SSH_TARGET=""
 SSH_PORT="22"
@@ -713,6 +714,7 @@ while [[ $# -gt 0 ]]; do
             EXPLICIT_LANG=true
             shift
             ;;
+        --pair) PAIR=true ;;
         -q|--quick)
             QUICK=true
             shift
@@ -764,7 +766,7 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -h|--help)
-            echo "Usage: $0 [--lang=en|ru] [-q|--quick] [--mode=tunnel|standalone|gateway] [--user=<node-name>] [--token=<token>] [--domain=<shared-domain>] [--port=<port>] [--ssh=user@host] [--dry-run]"
+            echo "Usage: $0 [--lang=en|ru] [-q|--quick] [--mode=tunnel|standalone|gateway] [--user=<node-name>] [--token=<token>] [--domain=<shared-domain>] [--port=<port>] [--ssh=user@host] [--dry-run] [--pair]"
             echo ""
             echo "All nodes use ONE shared domain; the node is selected by ?user=<node-name>:"
             echo "  MCP URL: https://<shared-domain>/sse?user=<node-name>&token=<token>"
@@ -898,7 +900,7 @@ if [ ! -f "$SCRIPT_DIR/core/agent.py" ]; then
     # tests/test_installer_bootstrap.py fails when a core module is missing here.
     for f in core/__init__.py core/agent.py core/agent_harness.py core/code_cache.py \
              core/device.py core/domain.py core/hooks.py core/mcp_tools.py core/paths.py \
-             core/policies.py core/rekey.py \
+             core/policies.py core/rekey.py core/onboarding.py \
              core/redact.py core/schemas.py core/server.py core/subagents.py core/termux.py \
              core/triggers.py core/updater.py core/version.py core/vitals.py core/web_share.py \
              skills/orchestrator.md; do
@@ -1892,6 +1894,20 @@ json_field() {
     printf '%s' "$1" | "$PYTHON_BIN" -c 'import json, sys; print(json.load(sys.stdin).get(sys.argv[1], ""))' "$2" 2>/dev/null | tr -d '\r\n' || true
 }
 
+if [ "$PAIR" = true ]; then
+    (cd "$SCRIPT_DIR" && "$PYTHON_BIN" -m core.onboarding pair \
+        --gateway "https://${GATEWAY}" --config-dir "$CONFIG_DIR" --name "$USERNAME") || exit 1
+    REG_RESP=$(cd "$SCRIPT_DIR" && "$PYTHON_BIN" - "$CONFIG_FILE" <<'PAIR_JSON'
+import json,sys
+from core.domain import read_env_file
+c=read_env_file(sys.argv[1])
+print(json.dumps({"username":c["MESH_USER"],"token":c["MESH_TOKEN"],"link_key":c["MESH_LINK_KEY"]}))
+PAIR_JSON
+    )
+    ASSIGNED_USER=$(json_field "$REG_RESP" username)
+    ASSIGNED_TOKEN=$(json_field "$REG_RESP" token)
+    ASSIGNED_LINK=$(json_field "$REG_RESP" link_key)
+else
 REG_BODY="{\"username\": \"${USERNAME}\", \"auto_suffix\": true, \"mac_address\": \"${DETECTED_MAC}\", \"os\": \"${DETECTED_OS}\", \"arch\": \"${DETECTED_ARCH}\""
 if [ -n "$REQ_TOKEN" ]; then
     REG_BODY="${REG_BODY}, \"token\": \"${REQ_TOKEN}\""
@@ -1925,6 +1941,8 @@ if [ -z "$ASSIGNED_TOKEN" ]; then
     exit 1
 fi
 
+fi
+
 if [ "$ASSIGNED_USER" != "$USERNAME" ]; then
     if [ "$LANG_CHOICE" = "ru" ]; then
         echo -e "${YELLOW}ℹ️  Имя '${USERNAME}' уже было занято. Автоматически назначено имя узла:${RESET} ${BOLD}${GREEN}${ASSIGNED_USER}${RESET}"
@@ -1939,6 +1957,7 @@ else
     echo "[3/4] Saving configuration to ${CONFIG_FILE}..."
 fi
 
+if [ "$PAIR" != true ]; then
 cat << EOF > "$CONFIG_FILE"
 MESH_GATEWAY=${GATEWAY}
 MESH_USER=${ASSIGNED_USER}
@@ -1946,6 +1965,7 @@ MESH_TOKEN=${ASSIGNED_TOKEN}
 MESH_LINK_KEY=${ASSIGNED_LINK}
 EOF
 chmod 600 "$CONFIG_FILE"
+fi
 
 # agent.env carries only the legacy MESH_GATEWAY, which core/domain.py honours for
 # the tunnel but never for the links a node publishes. Writing the domain down is
@@ -2038,6 +2058,13 @@ sleep 1
 # cannot open a tunnel, so a leaked link is revoked without reinstalling the node.
 MCP_URL="$(node_sse_url "$ASSIGNED_USER" "${ASSIGNED_LINK:-$ASSIGNED_TOKEN}")"
 
+# A connector is ready only after a real command has reached this device.
+if [ "$PAIR" = true ]; then
+    (cd "$SCRIPT_DIR" && "$PYTHON_BIN" -m core.onboarding status --config-dir "$CONFIG_DIR") || exit 1
+    MCP_URL="https://${GATEWAY}/mcp?user=${ASSIGNED_USER}&token=${ASSIGNED_LINK}"
+    echo "ChatGPT: add a separate MCP connector for this device; choose No authentication."
+fi
+
 # Quick Copy to Clipboard
 COPIED=false
 B64_URL=$(printf "%s" "$MCP_URL" | base64 | tr -d '\r\n')
@@ -2061,7 +2088,9 @@ fi
 
 clear 2>/dev/null || printf "\033[2J\033[H" || true
 
-if [ "$LANG_CHOICE" = "ru" ]; then
+if [ "$PAIR" = true ]; then
+    print_mcp_box "ChatGPT — private Server URL for ${ASSIGNED_USER}" "$MCP_URL" "No authentication; one connector per device"
+elif [ "$LANG_CHOICE" = "ru" ]; then
     echo ""
     copy_msg=""
     if [ "$COPIED" = true ]; then

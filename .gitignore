@@ -36,3 +36,5 @@ dist/
 # a local `npm install` in a checkout must never be committed.
 node_modules/
 npm-debug.log*
+
+.venv/

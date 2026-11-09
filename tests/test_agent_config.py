@@ -185,4 +185,4 @@ def test_tunnel_uri_uses_the_shared_domain_contract(monkeypatch):
     monkeypatch.setattr(agent, "GATEWAY_HOST", "example.test")
     monkeypatch.setattr(agent, "USER", "node-one")
     monkeypatch.setattr(agent, "TOKEN", "tok")
-    assert agent.tunnel_uri() == "wss://example.test/ws/tunnel?user=node-one&token=tok"
+    assert agent.tunnel_uri() == "wss://example.test/ws/tunnel?user=node-one"

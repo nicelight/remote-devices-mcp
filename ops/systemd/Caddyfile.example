@@ -1,0 +1,5 @@
+gateway.example.com {
+    reverse_proxy 172.19.0.1:8096 {
+        flush_interval -1
+    }
+}

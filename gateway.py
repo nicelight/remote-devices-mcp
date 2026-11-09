@@ -54,14 +54,15 @@ class CredentialRedactionFilter(logging.Filter):
 for _log_name in ("uvicorn.access", "uvicorn.error", "gateway"):
     logging.getLogger(_log_name).addFilter(CredentialRedactionFilter())
 
-REGISTRY_PATH = "/etc/remote-harness-mcp/registry.json"
+REGISTRY_PATH = os.environ.get("MESH_REGISTRY_PATH", "/etc/remote-harness-mcp/registry.json")
 #: Registry location from before the rename. A gateway deployed earlier keeps its
 #: node registrations there, so an existing install is read and written in place
 #: instead of starting from an empty registry (gateway.py is deployed standalone,
 #: so this stays a local fallback rather than importing core.paths).
 LEGACY_REGISTRY_PATH = "/etc/antigravity-mesh/registry.json"
-if not os.path.exists(REGISTRY_PATH) and os.path.exists(LEGACY_REGISTRY_PATH):
+if not os.environ.get("MESH_REGISTRY_PATH") and not os.path.exists(REGISTRY_PATH) and os.path.exists(LEGACY_REGISTRY_PATH):
     REGISTRY_PATH = LEGACY_REGISTRY_PATH
+INSTANCE_ID = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
 active_tunnels = {}  # user -> {"ws": WebSocket, "pending": {req_id: Future}}
 # user -> list of asyncio.Queue, OLDEST stream first. This was a set, which has
 # no order: the per-user cap below has to evict the OLDEST stream, and every
@@ -308,13 +309,24 @@ def load_registry() -> dict:
             with open(REGISTRY_PATH, "r") as f:
                 return json.load(f)
         except Exception as e:
-            logger.error(f"Failed to read registry: {e}")
+            # Do not turn a damaged registry into an empty registry and overwrite it.
+            raise RuntimeError("Cannot read device registry; refusing to modify registrations") from e
     return {}
 
 def save_registry(data: dict):
     os.makedirs(os.path.dirname(REGISTRY_PATH), exist_ok=True)
-    with open(REGISTRY_PATH, "w") as f:
-        json.dump(data, f, indent=2)
+    # Replace atomically: a crash must not truncate all device registrations.
+    import tempfile
+    fd, staged = tempfile.mkstemp(prefix=".registry-", dir=os.path.dirname(REGISTRY_PATH))
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(staged, REGISTRY_PATH)
+    finally:
+        if os.path.exists(staged):
+            os.unlink(staged)
 
 def tokens_equal(a: str, b: str) -> bool:
     """Constant-time token comparison that never raises on non-ASCII input.
@@ -595,7 +607,10 @@ async def call_remote_tool(user: str, name: str, args: dict) -> dict:
         # Wait for the agent to come back and replay the call once instead of
         # failing the client's request.
         logger.warning(f"Tunnel call to '{user}' failed ({e}); waiting for reconnect and retrying once")
-        for _ in range(4):                       # up to ~2 seconds
+        # A lost response does not prove a write failed. Never replay mutations.
+        if not TOOL_ANNOTATIONS.get(name, {}).get("readOnlyHint", False):
+            return {"exit_code": 1, "error": "Tunnel disconnected; execution outcome unknown. Inspect device state before retrying."}
+        for _ in range(4):
             await asyncio.sleep(0.5)
             fresh = active_tunnels.get(user)
             if fresh and fresh.get("ws") and fresh.get("ws") is not tunnel.get("ws"):
@@ -639,12 +654,17 @@ def remote_tool_error(res):
 async def health(request: Request):
     if request.method == "OPTIONS":
         return Response(status_code=204, headers={"Allow": "GET, HEAD, OPTIONS", "Access-Control-Allow-Origin": "*"})
+    if os.environ.get("MESH_PRIVATE_HEALTH") == "1":
+        authorised, _, _ = verify_token(request)
+        if not authorised and not admin_authorised(request):
+            return JSONResponse({"status": "healthy"})
     user = get_target_user(request)
     is_online = (user in active_tunnels) if user != "anonymous" else False
     return JSONResponse({
         "status": "healthy",
         "service": "remote_harness_mcp_gateway",
         "host": PUBLIC_HOST,
+        "instance_id": INSTANCE_ID,
         "target_user": user,
         "node_online": is_online,
         "active_tunnels_count": len(active_tunnels),
@@ -885,7 +905,7 @@ async def api_register(request: Request):
 #   2. a human with admin rights approves  POST /v1/devices/pair/{code}/approve
 #   3. the node collects its credentials   GET  /v1/devices/pair/{code}
 #
-# The credentials are handed out exactly once, after approval, and the code dies
+# Credentials are issued once; the initiating device may retry delivery until the code dies
 # with its 10-minute TTL. Nothing is created in the registry before step 2, so a
 # bot that can reach the endpoint can at worst ask for codes.
 PAIR_TTL_SECONDS = 600
@@ -904,7 +924,7 @@ def admin_authorised(request: Request) -> bool:
 def purge_pairs() -> None:
     now = time.time()
     for code, pair in list(pending_pairs.items()):
-        if pair.get("expires_at", 0) < now or pair.get("collected"):
+        if pair.get("expires_at", 0) < now:
             pending_pairs.pop(code, None)
 
 
@@ -937,7 +957,9 @@ async def device_pair_start(request: Request):
     if not isinstance(data, dict):
         data = {}
     code = new_pair_code()
+    device_secret = secrets.token_urlsafe(32)
     pending_pairs[code] = {
+        "device_secret_sha256": hash_secret(device_secret),
         "created_at": time.time(),
         "expires_at": time.time() + PAIR_TTL_SECONDS,
         "hostname": str(data.get("hostname") or "")[:100],
@@ -951,13 +973,14 @@ async def device_pair_start(request: Request):
     logger.info("Pairing code %s issued (host=%s)", code, pending_pairs[code]["hostname"] or "?")
     return JSONResponse({
         "pair_code": code,
+        "device_secret": device_secret,
         "pair_url": f"{PUBLIC_BASE_URL}/pair?code={code}",
         "expires_in": PAIR_TTL_SECONDS,
         "message": (
             "Approve this code with POST /v1/devices/pair/{code}/approve and an "
             "X-Admin-Token header, then collect the credentials from this endpoint."
         ),
-    }, status_code=201)
+    }, status_code=201, headers={"Cache-Control": "no-store"})
 
 
 async def device_pair_status(request: Request):
@@ -975,9 +998,14 @@ async def device_pair_status(request: Request):
             "status": "pending",
             "expires_in": max(0, int(pair["expires_at"] - time.time())),
         })
+    supplied = request.headers.get("x-pair-secret", "")
+    if not supplied or not tokens_equal(hash_secret(supplied), pair["device_secret_sha256"]):
+        return JSONResponse({"error": "pair_secret_required"}, status_code=403)
+    # Same device may retry a lost HTTP response until TTL. No second node/token
+    # is created, and knowing the short human code never reveals credentials.
+    pair["collected"] = True
     issued = pair.get("issued") or {}
-    pending_pairs.pop(code, None)          # credentials are handed out once
-    return JSONResponse({"status": "approved", **issued})
+    return JSONResponse({"status": "approved", **issued}, headers={"Cache-Control": "no-store"})
 
 
 async def device_pair_approve(request: Request):
@@ -1155,6 +1183,82 @@ async def device_revoke(request: Request):
     return JSONResponse({"status": "revoked", "username": user})
 
 
+async def pairing_page(request: Request):
+    """Human confirmation for the existing admin-approved pairing protocol."""
+    import html
+    purge_pairs()
+    code = (request.query_params.get("code") or "").upper().strip()
+    pair = pending_pairs.get(code)
+    if not pair:
+        return Response("Pairing code missing or expired. Run the installer again.", status_code=404)
+    nonce = secrets.token_urlsafe(24)
+    code_json = json.dumps(code)
+    body = '''<!doctype html><html lang="ru"><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Remote Harness — привязка устройства</title>
+<body><main><h1>Привязка устройства</h1>
+<p>Устройство: <strong>HOSTNAME</strong> · OSNAME</p>
+<p>Проверьте, что код <strong>PAIRCODE</strong> совпадает с кодом в установщике.</p>
+<p>Подтверждение выполняет администратор Gateway. Не передавайте его ключ владельцу устройства.
+После подтверждения установщик сам сохранит настройки, запустит агент и проверит связь.</p>
+<p>Доступ позволяет выполнять команды и изменять файлы от имени пользователя агента.
+Один коннектор управляет только этим устройством.</p>
+<form id="approve"><label>Ключ администратора <input id="key" type="password" required autocomplete="off"></label>
+<button>Подтвердить устройство</button></form><p id="status" role="status"></p>
+<script nonce="NONCE">
+const code=CODE_JSON;
+document.getElementById('approve').addEventListener('submit',async e=>{
+ e.preventDefault(); const field=document.getElementById('key'); const secret=field.value; field.value='';
+ const status=document.getElementById('status');
+ try {
+  const response=await fetch('/v1/devices/pair/'+encodeURIComponent(code)+'/approve',{
+   method:'POST',headers:{'Content-Type':'application/json','X-Admin-Token':secret},body:'{}'});
+  if(!response.ok){status.textContent='Подтверждение отклонено (HTTP '+response.status+'). Проверьте ключ и срок действия кода.';return;}
+  const result=await response.json(); document.getElementById('approve').hidden=true;
+  status.textContent='Привязка подтверждена: '+result.username+'. Вернитесь к установщику и дождитесь проверки соединения.';
+ } catch(error){status.textContent='Не удалось связаться с Gateway. Попробуйте ещё раз.';}
+});
+</script></main></body></html>'''
+    # Escape untrusted device metadata; never reflect host headers or credentials.
+    body = body.replace('HOSTNAME', html.escape(pair['hostname'])).replace('OSNAME', html.escape(pair['os']))
+    body = body.replace('PAIRCODE', html.escape(code)).replace('NONCE', nonce).replace('CODE_JSON', code_json)
+    return Response(body, media_type='text/html', headers={
+        'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer',
+        'X-Content-Type-Options': 'nosniff',
+        'Content-Security-Policy': f"default-src 'none'; script-src 'nonce-{nonce}'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+    })
+
+
+async def installer_asset(request: Request):
+    """Publish code only, never a directory, configuration, registry or token."""
+    from pathlib import Path
+    root = Path(__file__).resolve().parent
+    relative = request.url.path.lstrip('/')
+    allowed = {'install.sh', 'install.ps1', 'skills/orchestrator.md',
+               'ops/windows/agent-watchdog.ps1', 'ops/windows/run-hidden.vbs',
+               'ops/update.ps1', 'ops/doctor.ps1'}
+    allowed.update('core/' + p.name for p in (root / 'core').glob('*.py') if not p.is_symlink())
+    if relative not in allowed:
+        return Response('Not found', status_code=404)
+    target = root / relative
+    if not target.is_file() or target.is_symlink():
+        return Response('Not found', status_code=404)
+    payload = target.read_bytes()
+    if relative == 'install.sh':
+        text = payload.decode('utf-8')
+        text = re.sub(r'^PUBLISHED_DOMAIN=.*$', lambda m: 'PUBLISHED_DOMAIN=' + json.dumps(PUBLIC_HOST), text, flags=re.MULTILINE)
+        text = text.replace('PAIR=false', 'PAIR=true', 1)
+        payload = text.encode('utf-8')
+    elif relative == 'install.ps1':
+        text = payload.decode('utf-8-sig')
+        text = re.sub(r'(?m)^(\s*)\$PublishedDomain = .*$', lambda m: m[1] + '$PublishedDomain = ' + json.dumps(PUBLIC_HOST), text)
+        text = text.replace('[switch]$Pair,', '[switch]$Pair = $true,', 1)
+        payload = ('\ufeff' + text).encode('utf-8')
+    return Response(payload if request.method != 'HEAD' else b'', media_type='text/plain',
+                    headers={'Cache-Control': 'no-cache', 'X-Content-Type-Options': 'nosniff',
+                             'Content-Length': str(len(payload))})
+
+
 async def oauth_discovery(request: Request):
     """RFC 9728 protected-resource metadata.
 
@@ -1269,7 +1373,7 @@ async def sse_endpoint(request: Request):
                 endpoint = f"/messages?user={user}"
                 if endpoint_credential:
                     endpoint += f"&token={endpoint_credential}"
-                yield f"event: endpoint\ndata: {endpoint}\n\n"
+                yield f"event: endpoint\ndata: {endpoint}&stream_id={stream_key}\n\n"
             while True:
                 try:
                     remaining = keepalive_interval - (time.monotonic() - last_write)
@@ -1334,6 +1438,13 @@ async def messages_endpoint(request: Request):
             }
         )
 
+    classic_stream = None
+    stream_id = request.query_params.get("stream_id")
+    if request.url.path == "/messages" and stream_id:
+        classic_stream = active_sse_sessions.get(stream_id)
+        if classic_stream is None or classic_stream not in active_sse_subscribers.get(user, []):
+            return JSONResponse({"error": "SSE stream expired; reconnect"}, status_code=404)
+
     try:
         body = await request.json()
     except Exception:
@@ -1363,17 +1474,8 @@ async def messages_endpoint(request: Request):
     accept_hdr = (request.headers.get("accept") or "").lower()
     incoming_session = request.headers.get("mcp-session-id") or ""
     proto_hdr = request.headers.get("mcp-protocol-version") or ""
-    tool_note = ""
-    if method == "tools/call":
-        # Log which tool the client asked for: without it a retry loop in the
-        # client is impossible to diagnose from the gateway side.
-        try:
-            tool_note = ", tool=%s, args=%s" % (
-                params.get("name"),
-                json.dumps(params.get("arguments", {}), ensure_ascii=False)[:120],
-            )
-        except Exception:
-            tool_note = ", tool=?"
+    # Arguments can contain file contents, credentials and private messages.
+    tool_note = f", tool={params.get('name')}" if method == "tools/call" else ""
     logger.info(f"Incoming MCP RPC from {client_ip} [{user}]: method={method}, id={req_id}{tool_note}"
                 + (f", accept={accept_hdr[:60]!r}" if accept_hdr else "")
                 + (f", session={incoming_session[:40]!r}" if incoming_session else ", session=<none>")
@@ -1409,7 +1511,7 @@ async def messages_endpoint(request: Request):
         # The response-header contract is untouched: the NEW id is what this
         # response returns.
         previous_session_id = latest_session_by_user.get(user)
-        if previous_session_id:
+        if previous_session_id and classic_stream is None:
             closed = close_sse_streams_for_session(previous_session_id)
             active_sessions.pop(previous_session_id, None)
             if closed:
@@ -1450,7 +1552,7 @@ async def messages_endpoint(request: Request):
                 f"DEVICE: if system_info reports a 'device' block whose class is phone or tablet, prefer "
                 f"device_info / device_control for device-level work instead of hand-writing termux-* "
                 f"commands through bash_exec, and use device_capture / device_messages for the camera, "
-                f"microphone, location, SMS or contacts - they run without a confirmation dialog, so "
+                f"microphone, location, SMS or contacts. Client approval and "
                 f"the node's own MESH_DEVICE / MESH_DEVICE_ACTIONS / MESH_DEVICE_PIM switches are what "
                 f"decides whether the call is allowed."
             )
@@ -1514,9 +1616,8 @@ async def messages_endpoint(request: Request):
                         "on Windows - call system_info first and match command_shell. "
                         "Use it to inspect git status, run builds, check processes or run tasks, "
                         "and NEVER guess command outputs. Commands that install or remove "
-                        "software, or that delete data, are refused here: this tool runs without "
-                        "a confirmation dialog, so those must go through system_change, where the "
-                        "user is asked to confirm first."
+                        "software, or that delete data, are refused here and must go through "
+                        "system_change. Client permissions still apply to all commands."
                     ),
                     "inputSchema": {
                         "type": "object",
@@ -1712,7 +1813,7 @@ async def messages_endpoint(request: Request):
                     "description": (
                         "Camera, microphone, location, fingerprint, USB and infrared actions. These "
                         "observe the physical world or authenticate the person holding the phone, but "
-                        "they install and remove nothing, so they carry no confirmation prompt - the "
+                        "client approval settings apply in addition to device permissions; the "
                         "guard is the node's own switch (MESH_DEVICE, MESH_DEVICE_ACTIONS, "
                         "MESH_READ_ONLY), which refuses a call before any command runs. A photo or a "
                         "recording is written to the node's capture directory and is never uploaded "
@@ -1834,8 +1935,8 @@ async def messages_endpoint(request: Request):
                 {
                     "name": "write_file",
                     "description": (
-                        "Write a file atomically (creates parent dirs). Runs without a "
-                        "confirmation dialog, so a path inside the system - /etc, /usr, "
+                        "Write a file atomically (creates parent dirs). A path inside the "
+                        "system - /etc, /usr, "
                         "/boot, /var/lib, C:\\Windows, C:\\Program Files, ProgramData, the "
                         "registry - is refused and has to go through system_write, which "
                         "the user is asked to confirm."
@@ -1854,8 +1955,8 @@ async def messages_endpoint(request: Request):
                 {
                     "name": "edit_file",
                     "description": (
-                        "Replace an exact string in a file; old_string must be unique. Runs "
-                        "without a confirmation dialog, so a system path is refused here - "
+                        "Replace an exact string in a file; old_string must be unique. A "
+                        "system path is refused here - "
                         "read the file and write the whole new content with system_write "
                         "instead, which the user confirms."
                     ),
@@ -1929,8 +2030,8 @@ async def messages_endpoint(request: Request):
                     "name": "run_job",
                     "description": (
                         "Start a long command in the background; returns job_id. Installs, "
-                        "removals and deletions are refused here (this tool has no confirmation "
-                        "step) - run those with system_change(background=true)."
+                        "removals and deletions are refused here; run those with "
+                        "system_change(background=true)."
                     ),
                     "inputSchema": {
                         "type": "object",
@@ -2366,6 +2467,10 @@ async def messages_endpoint(request: Request):
     # and drop the session. Only the legacy transports (POST /messages, or
     # LEGACY_SSE which answers 202 with no body) are delivered on the stream.
     path = request.url.path
+    if classic_stream is not None:
+        # Classic SSE receives each response on exactly its own GET stream.
+        classic_stream.put_nowait(json.dumps(resp, ensure_ascii=False))
+        return Response(status_code=202)
     if should_broadcast_response(path):
         broadcast_sse(user, resp)
     else:
@@ -2413,6 +2518,7 @@ async def messages_endpoint(request: Request):
 
 async def mcp_unified_endpoint(request: Request):
     if request.method == "OPTIONS":
+        user = get_target_user(request)
         return Response(
             status_code=204,
             headers={
@@ -2644,13 +2750,11 @@ def _relay_headers(raw) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Confirmation policy: what goes through a tool the client confirms
+# Command routing policy. This is a convenience classifier, not a sandbox.
 # ---------------------------------------------------------------------------
-# bash_exec, run_job, write_file and edit_file are advertised with
-# readOnlyHint=true (see the policy below), and Gemini Spark - like any client
-# that keys its approval dialog on that hint - runs them without asking. That
-# promise is kept for the classes the operator wants gated, each with a confirmed
-# twin the model is told to use instead:
+# All commands are advertised as writes. The client controls approvals and the
+# agent's OS user/sandbox enforces permissions. The classifier routes common
+# system operations to their explicit tools:
 #
 #   install / delete   software is installed or removed, data is deleted
 #                      -> system_change
@@ -2831,11 +2935,8 @@ def command_confirmation_message(command: str, kind: str, tool: str) -> str:
     }.get(kind, "is a system change")
     return (
         f"[Confirmation required] This command {what}, so it was not run.\n"
-        f"{tool} is advertised as read-only and therefore runs without a confirmation "
-        f"dialog; the operator's rule is to be asked before anything is installed, "
-        f"deleted, run as root, or written into a system path. Call system_change with "
-        f"the same command - that tool is advertised as destructive, so the user is "
-        f"asked to confirm it first.\n"
+        f"Gateway policy routes this operation through system_change. "
+        f"Call system_change with the same command and respect client approval settings.\n"
         f"command: {command.strip() if isinstance(command, str) else command}\n"
         f"Do not rephrase, split, encode or otherwise obfuscate the command to get around "
         f"this; route it through system_change."
@@ -2846,10 +2947,8 @@ def path_confirmation_message(path: str, tool: str) -> str:
     """The refusal for write_file/edit_file aimed at a system path."""
     return (
         f"[Confirmation required] {path} is a system path, so it was not written.\n"
-        f"{tool} is advertised as read-only and runs without a confirmation dialog; the "
-        f"operator's rule is to be asked before anything outside their own files is "
-        f"changed. Use system_write(path=..., content=...) instead - it is advertised as "
-        f"destructive, so the user is asked to confirm the write first.\n"
+        f"Gateway policy requires system_write(path=..., content=...) for this path. "
+        f"Respect client approval settings.\n"
         f"path: {path}"
     )
 
@@ -2910,73 +3009,19 @@ def format_job_started(res, args) -> str:
 
 
 # ---------------------------------------------------------------------------
-# MCP tool annotations: when the client may run a tool without asking first
+# MCP annotations describe effects truthfully; they are not a permission bypass.
 # ---------------------------------------------------------------------------
-# Gemini Spark reads ``Tool.annotations`` from ``tools/list`` to decide whether it
-# must stop and ask the user "confirm this action?" before a call. A live check
-# (see CHANGES_AND_STATUS.md, section "Подтверждение только на установку/удаление")
-# showed its rule: the dialog is skipped for a tool advertised ``readOnlyHint:
-# true`` and raised for every other one, whatever ``destructiveHint`` says. The
-# spec's defaults are the pessimistic ones (readOnlyHint false, destructiveHint
-# true), so a tool advertised with no annotations is treated as destructive and
-# *every* call was confirmed. Declaring the hints explicitly therefore means: any
-# call that must not interrupt the operator is advertised read-only here, and the
-# only calls left asking are the system changes - installing/removing software,
-# sudo, system paths, a release install.
-#
-# This table is the gateway's own: the gateway deploys as one file and may not
-# import node code, so tests/test_gateway_share_route.py compares the advertised
-# hints with the node's TOOLS. The differences are deliberate and pinned there:
-# system_change and system_write exist only here (they are translated to
-# bash_exec/run_job/write_file before the node sees them); every tool this gateway
-# silences with a read-only claim is still advertised honestly by the node, whose
-# own surface has no classifier to keep the claim true for the shell/file twins,
-# and whose device branch is truthful as local work (nothing is installed or
-# removed) even though the client's dialog would then fire.
 _ANNOT_READ_ONLY = {
-    "readOnlyHint": True,
-    "destructiveHint": False,
-    "idempotentHint": True,
-    "openWorldHint": False,
+    "readOnlyHint": True, "destructiveHint": False,
+    "idempotentHint": True, "openWorldHint": False,
 }
-#: Tools that change something but are deliberately left without a dialog. What
-#: keeps the promise differs per group: the shell pair and the file pair are gated
-#: by classify_command() above (a gated class is refused and routed to
-#: system_change / system_write, which the user does confirm), while the device
-#: branch and ``unshare`` are refused by the node itself (MESH_DEVICE,
-#: MESH_DEVICE_ACTIONS, MESH_DEVICE_PIM, MESH_READ_ONLY; a share is re-publishable
-#: in one call). ``readOnlyHint`` is true on all of them on purpose: the client
-#: skips its dialog only for a tool it sees as read-only.
 _ANNOT_UNCONFIRMED_WRITE = {
-    "readOnlyHint": True,
-    "destructiveHint": False,
-    "idempotentHint": False,
-    "openWorldHint": False,
+    "readOnlyHint": False, "destructiveHint": False,
+    "idempotentHint": False, "openWorldHint": False,
 }
-#: Publishing hands out a password-like public link, so the client is told the
-#: tool reaches outside the host (openWorldHint). It is still not destructive.
-_ANNOT_PUBLISH = {
-    "readOnlyHint": True,
-    "destructiveHint": False,
-    "idempotentHint": False,
-    "openWorldHint": True,
-}
-_ANNOT_DESTRUCTIVE = {
-    "readOnlyHint": False,
-    "destructiveHint": True,
-    "idempotentHint": False,
-    "openWorldHint": False,
-}
+_ANNOT_PUBLISH = dict(_ANNOT_UNCONFIRMED_WRITE, openWorldHint=True)
+_ANNOT_DESTRUCTIVE = dict(_ANNOT_UNCONFIRMED_WRITE, destructiveHint=True)
 
-#: Confirmation policy per advertised tool; names must match core/mcp_tools.TOOLS.
-#: A tool left out stays unannotated on purpose and therefore asks for
-#: confirmation - the safe default for something nobody has judged yet.
-#: A prompt is spent on a system change only: system_change, system_write and
-#: mesh_update install, remove, delete or replace something the operator cannot
-#: undo in one call. Everything else - the device branch (camera, microphone,
-#: location, SMS, contacts) and ``unshare`` included - is advertised so the client
-#: runs it without a dialog; the node's own switches are what refuse a device call,
-#: and a revoked share is publishable again in one call.
 TOOL_ANNOTATIONS = {
     # read-only: looking around never needs a prompt
     "mesh_status": _ANNOT_READ_ONLY,
@@ -2991,37 +3036,17 @@ TOOL_ANNOTATIONS = {
     "job_list": _ANNOT_READ_ONLY,
     "share_list": _ANNOT_READ_ONLY,
     "device_info": _ANNOT_READ_ONLY,
-    # Commands run without a dialog; classify_command() refuses the gated classes
-    # (install/delete, sudo, system paths) and routes them to system_change.
-    "bash_exec": _ANNOT_UNCONFIRMED_WRITE,
-    "run_job": _ANNOT_UNCONFIRMED_WRITE,
-    # Files are written without a dialog too; a write into a system path is refused
-    # and routed to system_write, which the user confirms.
+    "bash_exec": dict(_ANNOT_DESTRUCTIVE, openWorldHint=True),
+    "run_job": dict(_ANNOT_DESTRUCTIVE, openWorldHint=True),
     "write_file": _ANNOT_UNCONFIRMED_WRITE,
     "edit_file": _ANNOT_UNCONFIRMED_WRITE,
-    # Stopping a job is neither an install nor a delete, and bash_exec can
-    # terminate the same process anyway, so no prompt is spent on it.
     "job_kill": _ANNOT_UNCONFIRMED_WRITE,
-    # The device branch (torch, volume, TTS, camera, microphone, location, SMS,
-    # contacts, ...): the node executes it and the node refuses it - MESH_DEVICE,
-    # MESH_DEVICE_ACTIONS, MESH_DEVICE_PIM and MESH_READ_ONLY are checked before
-    # any termux-* command runs. Gemini Spark raises its dialog for every tool it
-    # does not see as read-only (see the note above), so these are advertised
-    # read-only here to keep the rule "only a system change asks"; the node's own
-    # list keeps the literal local-write hint and a test pins the difference.
     "device_control": _ANNOT_UNCONFIRMED_WRITE,
     "device_capture": _ANNOT_UNCONFIRMED_WRITE,
-    "device_messages": _ANNOT_UNCONFIRMED_WRITE,
-    # publishing something on the internet: no dialog either, but the client is told
-    # the tool reaches outside the host
+    "device_messages": dict(_ANNOT_UNCONFIRMED_WRITE, openWorldHint=True),
     "share_file": _ANNOT_PUBLISH,
     "serve_dir": _ANNOT_PUBLISH,
-    # Revoking a share stops a local server and removes a copy the operator can
-    # publish again in one call; nothing is installed or deleted system-wide, so no
-    # prompt is spent on it either.
     "unshare": _ANNOT_UNCONFIRMED_WRITE,
-    # destructive: install/delete, sudo, system paths -> confirm first. These three
-    # are the only calls that interrupt the user.
     "system_change": _ANNOT_DESTRUCTIVE,
     "system_write": _ANNOT_DESTRUCTIVE,
     "mesh_update": _ANNOT_DESTRUCTIVE,
@@ -3356,6 +3381,15 @@ routes = [
     Route("/", health, methods=["GET", "HEAD", "OPTIONS"]),
     Route("/health", health, methods=["GET", "HEAD", "OPTIONS"]),
     Route("/health-mesh", health, methods=["GET", "HEAD", "OPTIONS"]),
+    Route("/pair", pairing_page, methods=["GET"]),
+    Route("/install.sh", installer_asset, methods=["GET", "HEAD"]),
+    Route("/install.ps1", installer_asset, methods=["GET", "HEAD"]),
+    Route("/core/{filename}", installer_asset, methods=["GET", "HEAD"]),
+    Route("/skills/orchestrator.md", installer_asset, methods=["GET", "HEAD"]),
+    Route("/ops/windows/agent-watchdog.ps1", installer_asset, methods=["GET", "HEAD"]),
+    Route("/ops/windows/run-hidden.vbs", installer_asset, methods=["GET", "HEAD"]),
+    Route("/ops/update.ps1", installer_asset, methods=["GET", "HEAD"]),
+    Route("/ops/doctor.ps1", installer_asset, methods=["GET", "HEAD"]),
     Route("/api/register", api_register, methods=["POST", "OPTIONS"]),
     # Device pairing: the join flow that does not hand a token to an anonymous
     # caller. Credentials are issued only after an admin approves the code.
@@ -3432,11 +3466,29 @@ async def tunnel_watchdog():
 @asynccontextmanager
 async def lifespan(_app):
     """Start the self-healing watchdog with the app (modern Starlette API)."""
+    # All tunnel state belongs to ONE process. Fail closed under --workers N.
+    lock = None
+    if os.name == "posix":
+        import fcntl
+        lock_path = os.environ.get("MESH_GATEWAY_LOCK", REGISTRY_PATH + ".lock")
+        os.makedirs(os.path.dirname(os.path.abspath(lock_path)), exist_ok=True)
+        lock = open(lock_path, "a")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lock.close()
+            raise RuntimeError("Gateway requires exactly one worker per registry: tunnel state is process-local")
     task = asyncio.create_task(tunnel_watchdog())
     try:
         yield
     finally:
         task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        if lock is not None:
+            lock.close()
 
 app = Starlette(debug=False, routes=routes, middleware=middleware, lifespan=lifespan)
 

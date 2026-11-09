@@ -291,7 +291,7 @@ def fake_phone(tmp_path):
           'esac\nexit 0\n' % REGISTRATION_JSON)
     _shim(shim, "termux-clipboard-set", 'cat > "%s"\n' % _posix(clipboard))
     # termux-services and the process check: runit "supervises" the node.
-    for name in ("sv", "runsvdir", "sv-enable", "service-daemon", "pgrep"):
+    for name in ("sv", "runsvdir", "sv-enable", "service-daemon", "pgrep", "pkill"):
         _shim(shim, name, "exit 0\n")
 
     return {"home": home, "prefix": prefix, "shim": shim, "log": log,

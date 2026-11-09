@@ -167,9 +167,9 @@ def test_a_stream_whose_queue_write_raises_is_removed(tmp_path, monkeypatch):
 
     queue, chunks = asyncio.run(drain())
 
-    assert chunks == [
-        "event: endpoint\ndata: /messages?user=%s&token=%s\n\n" % (USER, TOKEN)
-    ], "the existing endpoint framing must survive, then the stream closes"
+    assert len(chunks) == 1 and chunks[0].startswith(
+        "event: endpoint\ndata: /messages?user=%s&token=%s&stream_id=" % (USER, TOKEN)
+    ), "the existing endpoint framing must survive, then the stream closes"
     assert queue not in gateway.active_sse_subscribers.get(USER, [])
     assert queue not in list(gateway.active_sse_sessions.values())
     assert queue not in [q for qs in gateway.active_sse_session_queues.values() for q in qs]
@@ -191,9 +191,9 @@ def test_an_evicted_stream_is_also_dropped_when_it_is_read(tmp_path, monkeypatch
 
     evicted, survivors, chunks = asyncio.run(drain())
 
-    assert chunks == [
-        "event: endpoint\ndata: /messages?user=%s&token=%s\n\n" % (USER, TOKEN)
-    ], "the evicted stream closes after its endpoint frame"
+    assert len(chunks) == 1 and chunks[0].startswith(
+        "event: endpoint\ndata: /messages?user=%s&token=%s&stream_id=" % (USER, TOKEN)
+    ), "the evicted stream closes after its endpoint frame"
     assert evicted.empty(), "the evicted queue consumed its close sentinel"
     assert evicted not in gateway.active_sse_subscribers.get(USER, [])
     assert len(survivors) == gateway.MAX_SSE_PER_USER

@@ -1,0 +1,20 @@
+[Unit]
+Description=Remote Harness MCP unprivileged VPS node
+Wants=network-online.target
+After=network-online.target rhm-gateway.service
+[Service]
+User=rhm-node
+Group=rhm-node
+WorkingDirectory=/opt/remote-harness-mcp
+Environment=MESH_CONFIG_FILE=/var/lib/rhm-node/agent.env
+ExecStart=/opt/remote-harness-mcp/.venv/bin/python -m core.agent
+Restart=always
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/rhm-node
+[Install]
+WantedBy=multi-user.target

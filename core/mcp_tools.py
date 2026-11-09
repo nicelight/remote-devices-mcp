@@ -3317,7 +3317,7 @@ TOOLS: List[Dict[str, Any]] = [
         "description": (
             "Camera, microphone, location, fingerprint, USB and infrared actions. These "
             "observe the physical world or authenticate the person holding the phone, but "
-            "they install and remove nothing, so they carry no confirmation prompt - the "
+            "client approval settings apply in addition to device permissions; the "
             "guard is the node's own switch (MESH_DEVICE, MESH_DEVICE_ACTIONS, "
             "MESH_READ_ONLY), which refuses a call before any command runs. A photo or a "
             "recording is written to the node's capture directory and is never uploaded "

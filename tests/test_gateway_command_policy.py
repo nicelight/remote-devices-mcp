@@ -339,15 +339,12 @@ def test_system_change_is_advertised_as_destructive(tmp_path, monkeypatch):
     ))
     tools = {tool["name"]: tool for tool in json.loads(response.body)["result"]["tools"]}
 
-    # Gemini Spark skips its dialog only for a tool it sees as read-only, so every
-    # call the operator must not be interrupted by is advertised read-only on the
-    # gateway surface. system_change / system_write / mesh_update are the only ones
-    # left carrying destructiveHint, and they are the only ones that interrupt.
+    # Side effects must remain visible to clients such as ChatGPT.
     for name in ("bash_exec", "run_job", "write_file", "edit_file", "job_kill",
-                 "share_file", "serve_dir", "unshare", "device_info",
+                 "share_file", "serve_dir", "unshare",
                  "device_control", "device_capture", "device_messages"):
-        assert tools[name]["annotations"]["readOnlyHint"] is True, name
-        assert tools[name]["annotations"]["destructiveHint"] is False, name
+        assert tools[name]["annotations"]["readOnlyHint"] is False, name
+    assert tools["device_info"]["annotations"]["readOnlyHint"] is True
     for name in ("system_change", "system_write", "mesh_update"):
         assert tools[name]["annotations"]["destructiveHint"] is True, name
         assert tools[name]["annotations"]["readOnlyHint"] is False, name

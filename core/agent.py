@@ -667,7 +667,7 @@ def tunnel_uri() -> str:
     base = GATEWAY_HOST.rstrip("/")
     if not base.startswith(("ws://", "wss://")):
         base = "wss://" + base
-    return f"{base}/ws/tunnel?user={USER}&token={TOKEN}"
+    return f"{base}/ws/tunnel?user={USER}"
 
 
 async def run_agent():
@@ -687,7 +687,12 @@ async def run_agent():
     in_flight = set()
     while True:
         try:
-            async with websockets.connect(uri, ping_interval=10, ping_timeout=10,
+            # websockets >=14 renamed extra_headers to additional_headers.
+            import inspect
+            header_arg = ("additional_headers" if "additional_headers" in
+                          inspect.signature(websockets.connect).parameters else "extra_headers")
+            async with websockets.connect(uri, **{header_arg: {"Authorization": f"Bearer {TOKEN}"}},
+                                            ping_interval=10, ping_timeout=10,
                                             close_timeout=5, open_timeout=15,
                                             max_size=None) as ws:
                 logger.info(f"Connected to Mesh Gateway as '{USER}'!")

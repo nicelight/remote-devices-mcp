@@ -26,6 +26,7 @@
     "LICENSE",
     "gateway.py",
     "gateway_identity.py",
+    "gateway_assets",
     "requirements-gateway.txt"
   ],
   "keywords": [

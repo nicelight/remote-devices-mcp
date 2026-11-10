@@ -107,6 +107,25 @@ def connector_url(base, config):
     return base + '/mcp?' + urllib.parse.urlencode({'user': config['MESH_USER'], 'token': key})
 
 
+def confirm_browser(announce=announce_progress):
+    prompt = 'Приступить к авторизации через браузер? [Enter — да / нет]: '
+    try:
+        if sys.stdin.isatty():
+            answer = input(prompt)
+        else:
+            # A curl | bash installation must not read an answer from the script
+            # pipe. Ask through the controlling terminal when one is available.
+            with open('CONIN$' if os.name == 'nt' else '/dev/tty', 'r') as terminal:
+                print(prompt, end='', flush=True)
+                answer = terminal.readline()
+                if not answer:
+                    raise EOFError
+    except (EOFError, OSError):
+        announce('Нет интерактивного ввода. Откройте ссылку выше вручную.')
+        return False
+    return answer.strip().casefold() not in {'нет', 'no', 'n'}
+
+
 def pair(base, config_dir, name, *, timeout=600, open_browser=True, announce=announce_progress, progress=None):
     """Resume the same pairing/config on retries; never silently re-enrol a node."""
     root = Path(config_dir)
@@ -142,11 +161,12 @@ def pair(base, config_dir, name, *, timeout=600, open_browser=True, announce=ann
     code = pending['pair_code']
     verify_url = base + '/pair?' + urllib.parse.urlencode({'code': code})
     announce('Войдите через Google и нажмите «Подключить устройство». Код вводить не нужно.\nSign in with Google and confirm this device; no code entry needed.\n' + verify_url + '\nКод для сверки / Device code: ' + code)
-    if open_browser:
+    if open_browser and confirm_browser(announce):
         try:
-            webbrowser.open(verify_url)
+            if not webbrowser.open(verify_url):
+                announce('Не удалось открыть браузер. Откройте ссылку выше вручную.')
         except Exception:
-            pass  # A headless device can open the printed link on another device.
+            announce('Не удалось открыть браузер. Откройте ссылку выше вручную.')
     if progress:
         progress(pending)
     deadline = min(time.time() + timeout, pending['expires_at'])

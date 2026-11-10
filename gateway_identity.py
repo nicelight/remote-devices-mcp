@@ -38,6 +38,7 @@ label{display:block;margin:20px 0 8px}input,textarea{width:100%;border:1px solid
 code{overflow-wrap:anywhere}.code{font:700 28px/1.3 ui-monospace,monospace;letter-spacing:.09em;padding:18px;border:1px solid var(--line);border-radius:12px;text-align:center;background:#f7fbff}
 .steps{display:flex;flex-wrap:wrap;gap:8px 18px;list-style:none;padding:0;font-size:13px;color:var(--muted);margin:0 0 24px}.steps li[aria-current]{color:#185baf;font-weight:700}
 .device{border-top:1px solid var(--line);padding:24px 0 4px;margin-top:24px}.actions{display:flex;flex-wrap:wrap;gap:12px;margin:20px 0}.actions form{margin:0}.notice{border-left:3px solid #4d86bb;padding:8px 16px;background:#e6f2ff80;border-radius:0 10px 10px 0}.danger{border-left-color:#b34444}
+.connect-guide{margin:20px 0 28px}.connect-guide img{display:block;width:100%;height:auto;border:1px solid var(--line);border-radius:12px}.connect-guide figcaption{font-size:14px;color:var(--muted);margin-top:12px}.auth-hint{display:block;margin-top:10px;font-size:18px;color:var(--ink)}
 footer{margin-top:24px;font-size:14px;color:var(--muted)}[role=status]{white-space:pre-wrap}details{margin-top:16px}summary{cursor:pointer;min-height:44px;padding:8px 0}
 @media(min-width:640px){main{padding-top:64px}.panel{padding:40px}}
 @media(prefers-reduced-motion:no-preference){.panel{animation:appear .35s ease-out}@keyframes appear{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}}
@@ -48,9 +49,9 @@ footer{margin-top:24px;font-size:14px;color:var(--muted)}[role=status]{white-spa
 <section class="panel"><h1>{escape(title)}</h1>{content}</section><footer>Одно устройство — одно подключение. Доступ можно отозвать в любой момент.</footer></main>
 {('<script nonce="'+nonce+'">'+script+'</script>') if script else ''}</body></html>'''
     return Response(document, status_code=status, media_type='text/html', headers={
-        'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer',
+        'Cache-Control': 'no-store', 'Referrer-Policy': 'strict-origin',
         'X-Content-Type-Options': 'nosniff',
-        'Content-Security-Policy': f"default-src 'none'; style-src 'nonce-{nonce}'; script-src 'nonce-{nonce}'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+        'Content-Security-Policy': f"default-src 'none'; style-src 'nonce-{nonce}'; script-src 'nonce-{nonce}'; connect-src 'self'; img-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
     })
 
 

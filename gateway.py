@@ -1264,7 +1264,8 @@ async def owner_account(request: Request):
         link = PUBLIC_BASE_URL + '/mcp?' + urlencode({'user': user, 'token': entry['link_key']})
         content += f'<article class="device"><h2>{escape(entry.get("hostname") or user)}</h2><p class="muted">{escape(user)} · {escape(entry.get("os", ""))}</p>'
         content += f'<label for="url-{escape(user)}">Приватный Server URL</label><textarea id="url-{escape(user)}" rows="3" readonly spellcheck="false">{escape(link)}</textarea>'
-        content += f'<button class="secondary copy" data-target="url-{escape(user)}">Скопировать ссылку</button><div class="actions">'
+        content += f'<div class="actions"><button class="secondary copy" data-target="url-{escape(user)}">Скопировать ссылку</button><a class="button" href="https://chatgpt.com/plugins?directoryTab=personal" target="_blank" rel="noopener noreferrer">Вставить в ChatGPT</a></div>'
+        content += '<figure class="connect-guide"><img src="/assets/chatgpt-add-mcp.png" width="1019" height="216" loading="lazy" alt="В ChatGPT откройте Плагины → Личные, нажмите «Добавить», затем «Добавить пользовательский сервер MCP»."><figcaption>Сначала скопируйте ссылку. Затем в ChatGPT нажмите «Добавить» → «Добавить пользовательский сервер MCP» и вставьте её в Server URL. <span class="auth-hint">В настройках вместо <strong>oAuth</strong> - выберите <strong>No authentication</strong></span></figcaption></figure><div class="actions">'
         for action, label in [('check', 'Проверить связь'), ('rotate', 'Заменить ссылку'), ('revoke', 'Отозвать доступ')]:
             content += f'<form method="post" action="/account/devices/{escape(user)}/{action}">{form_fields(owner["csrf"])}<button class="secondary">{label}</button></form>'
         content += '</div></article>'
@@ -1306,6 +1307,13 @@ async def owner_device_action(request: Request):
     else:
         await revoke_node(user, registry)
     return RedirectResponse('/account', status_code=303, headers={'Cache-Control': 'no-store'})
+
+
+async def chatgpt_guide_image(request: Request):
+    from pathlib import Path
+    image_path = Path(__file__).resolve().parent / 'gateway_assets' / 'chatgpt-add-mcp.png'
+    return Response(image_path.read_bytes(), media_type='image/png', headers={
+        'Cache-Control': 'public, max-age=3600', 'X-Content-Type-Options': 'nosniff'})
 
 
 async def installer_asset(request: Request):
@@ -3465,6 +3473,7 @@ routes = [
     Route("/auth/google/callback", owner_auth.callback, methods=["GET"]),
     Route("/auth/logout", owner_auth.logout, methods=["POST"]),
     Route("/account", owner_account, methods=["GET"]),
+    Route("/assets/chatgpt-add-mcp.png", chatgpt_guide_image, methods=["GET"]),
     Route("/account/pair/{code}/approve", owner_pair_approve, methods=["POST"]),
     Route("/account/devices/{user}/{action}", owner_device_action, methods=["POST"]),
     Route("/install.sh", installer_asset, methods=["GET", "HEAD"]),

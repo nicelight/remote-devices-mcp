@@ -20,7 +20,7 @@
 
 ```bash
 curl -fSL --connect-timeout 10 --max-time 60 \
-  https://rhm.108-181-252-78.sslip.io/install.sh \
+  https://mcp.natureonzoom.win/install.sh \
   -o /tmp/rhm-install.sh &&
 bash /tmp/rhm-install.sh --pair --quick --lang=ru
 ```
@@ -36,7 +36,7 @@ bash /tmp/rhm-install.sh --pair --quick --lang=ru
 
 ```powershell
 $installerPath = Join-Path $env:TEMP 'rhm-install.ps1'
-Invoke-WebRequest -Uri 'https://rhm.108-181-252-78.sslip.io/install.ps1' -OutFile $installerPath
+Invoke-WebRequest -Uri 'https://mcp.natureonzoom.win/install.ps1' -OutFile $installerPath
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installerPath -Pair -Quick -Lang ru
 ```
 
@@ -47,7 +47,12 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installerPath -Pair -Qu
 
 ### 2 · Подтвердите устройство в браузере
 
-Установщик откроет страницу подключения:
+Установщик спросит: **«Приступить к авторизации через браузер?»**
+Нажмите **Enter**, чтобы открыть страницу подключения. Ответы `нет`, `no`, `n`
+(в любом регистре) оставят браузер закрытым — ссылку можно открыть вручную.
+Любой другой ответ также откроет браузер.
+
+На странице подключения:
 
 1. Нажмите **«Войти через Google»** и выберите свой аккаунт.
 2. Проверьте имя компьютера.
@@ -92,7 +97,7 @@ Google подтверждает владельца в кабинете, а до�
 
 ### Ваши устройства всегда под рукой
 
-Откройте **[кабинет Remote Harness](https://rhm.108-181-252-78.sslip.io/account)**,
+Откройте **[кабинет Remote Harness](https://mcp.natureonzoom.win/account)**,
 чтобы скопировать ссылку, проверить связь или управлять доступом:
 
 - **Заменить ссылку** — старый Server URL перестанет работать. Вставьте новый в ChatGPT.

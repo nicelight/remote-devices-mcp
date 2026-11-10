@@ -18,7 +18,7 @@
 - Не повторять автоматически изменяющую команду после потери ответа. `readOnlyHint` должен соответствовать реальному поведению инструмента.
 
 ## Развёртывание
-- VPS `108.181.252.78`, SSH alias `igorprod`; Gateway `https://rhm.108-181-252-78.sslip.io`.
+- VPS `108.181.252.78`, SSH alias `igorprod`; Gateway `https://mcp.natureonzoom.win`.
 - Код `/opt/remote-harness-mcp`, служба `rhm-gateway.service`, пользователь `rhm-gateway`, Python venv; внутренний адрес `172.19.0.1:8096`.
 - Gateway работает без Docker; HTTPS обслуживает **существующий** Caddy в Docker, конфиг `/opt/caddy/Caddyfile`. На VPS есть другие сервисы — сохранять их работу.
 - Registry `/var/lib/rhm-gateway/registry.json`; секреты `/etc/remote-harness-mcp/gateway.env`.

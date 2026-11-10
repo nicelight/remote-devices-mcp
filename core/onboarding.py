@@ -25,7 +25,13 @@ from core import domain, paths
 
 
 class OnboardingError(RuntimeError):
-    pass
+    def __init__(self, message, status_code=None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def announce_progress(message):
+    print(message, flush=True)
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -53,7 +59,15 @@ def request_json(base, path, *, data=None, headers=None, timeout=35):
             return json.load(response)
     except urllib.error.HTTPError as exc:
         # Do not include the request, credentials or response body in error output.
-        raise OnboardingError('Gateway returned HTTP %d; check pairing/access or run status' % exc.code) from None
+        messages = {
+            403: 'Доступ отклонён. В браузере войдите через Google и подтвердите своё устройство; не вводите ключ администратора.',
+            404: 'Заявка истекла или Gateway был перезапущен. Запустите установщик ещё раз.',
+            410: 'Привязка отозвана. Запустите установщик для новой заявки.',
+            429: 'Слишком много запросов. Подождите минуту и повторите.',
+            503: 'Gateway или устройство пока недоступны. Проверьте состояние службы.',
+        }
+        raise OnboardingError('Gateway returned HTTP %d. %s' % (exc.code,
+            messages.get(exc.code, 'Проверьте Gateway или выполните status.')), exc.code) from None
     except (OSError, ValueError) as exc:
         raise OnboardingError('Gateway unavailable: check internet, DNS and the HTTPS certificate') from None
 
@@ -93,7 +107,7 @@ def connector_url(base, config):
     return base + '/mcp?' + urllib.parse.urlencode({'user': config['MESH_USER'], 'token': key})
 
 
-def pair(base, config_dir, name, *, timeout=600, open_browser=True, announce=print, progress=None):
+def pair(base, config_dir, name, *, timeout=600, open_browser=True, announce=announce_progress, progress=None):
     """Resume the same pairing/config on retries; never silently re-enrol a node."""
     root = Path(config_dir)
     private_dir(root)
@@ -115,8 +129,9 @@ def pair(base, config_dir, name, *, timeout=600, open_browser=True, announce=pri
             raise OnboardingError('A pairing with another Gateway is pending')
         if pending['expires_at'] <= time.time():
             pending_path.unlink()
-            raise OnboardingError('Pairing code expired. Run the installer again for a new code.')
-    else:
+            announce('Срок старой заявки истёк. Создаём новую / Previous request expired; starting a new one.')
+    if not pending_path.exists():
+        announce('Создаём защищённую заявку / Creating a secure device request…')
         started = request_json(base, '/v1/devices/pair', data={
             'hostname': name, 'os': platform.system(), 'arch': platform.machine()})
         # Never open an arbitrary verification URL supplied by a server response.
@@ -126,7 +141,7 @@ def pair(base, config_dir, name, *, timeout=600, open_browser=True, announce=pri
         private_write(pending_path, json.dumps(pending))
     code = pending['pair_code']
     verify_url = base + '/pair?' + urllib.parse.urlencode({'code': code})
-    announce('Confirm this device in your browser: ' + verify_url + '\nDevice code: ' + code)
+    announce('Войдите через Google и нажмите «Подключить устройство». Код вводить не нужно.\nSign in with Google and confirm this device; no code entry needed.\n' + verify_url + '\nКод для сверки / Device code: ' + code)
     if open_browser:
         try:
             webbrowser.open(verify_url)
@@ -135,9 +150,18 @@ def pair(base, config_dir, name, *, timeout=600, open_browser=True, announce=pri
     if progress:
         progress(pending)
     deadline = min(time.time() + timeout, pending['expires_at'])
+    next_notice = 0
     while time.time() < deadline:
-        status = request_json(base, '/v1/devices/pair/' + urllib.parse.quote(code, safe=''),
-                              headers={'X-Pair-Secret': pending['device_secret']})
+        if time.time() >= next_notice:
+            announce('Ожидаем подтверждения в браузере / Waiting for browser confirmation (%ss осталось / remaining)…' % max(0, int(deadline-time.time())))
+            next_notice = time.time() + 10
+        try:
+            status = request_json(base, '/v1/devices/pair/' + urllib.parse.quote(code, safe=''),
+                                  headers={'X-Pair-Secret': pending['device_secret']}, timeout=15)
+        except OnboardingError as exc:
+            if exc.status_code in {404, 410}:
+                pending_path.unlink(missing_ok=True)
+            raise
         if status.get('status') == 'approved':
             config = {'MESH_PUBLIC_URL': base,
                       'MESH_USER': status['username'], 'MESH_TOKEN': status['token'],
@@ -170,15 +194,19 @@ def load_device(config_dir):
     return config
 
 
-def verify_device(base, config, timeout=40):
+def verify_device(base, config, timeout=40, announce=None):
     deadline = time.monotonic() + timeout
     last_error = 'Agent not connected'
+    next_notice = 0
     while True:
+        if announce and time.monotonic() >= next_notice:
+            announce('Проверяем реальный ответ MCP / Checking a real MCP response…')
+            next_notice = time.monotonic() + 5
         try:
             response = request_json(base, '/mcp?' + urllib.parse.urlencode({'user': config['MESH_USER']}),
                 data={'jsonrpc': '2.0', 'id': secrets.randbelow(2**31), 'method': 'tools/call',
                       'params': {'name': 'mesh_status', 'arguments': {}}},
-                headers={'Authorization': 'Bearer ' + config['MESH_TOKEN']}, timeout=max(1, min(35, deadline-time.monotonic())))
+                headers={'Authorization': 'Bearer ' + config['MESH_TOKEN']}, timeout=max(1, min(5, deadline-time.monotonic())))
             result = response.get('result', {})
             text = '\n'.join(c.get('text', '') for c in result.get('content', []))
             if not result.get('isError') and 'NODE REACHABLE' in text:
@@ -220,7 +248,7 @@ def main(argv=None):
             config = load_device(args.config_dir)
             # Stored identity wins over a machine-wide default on status/link.
             base = gateway_url(config['MESH_PUBLIC_URL'], args.allow_local_http)
-            evidence = verify_device(base, config, timeout=args.timeout or 40)
+            evidence = verify_device(base, config, timeout=args.timeout or 40, announce=announce_progress)
             print('CONNECTED — real MCP response from ' + config['MESH_USER'] + '\n' + evidence)
             if args.action == 'link':
                 print('Private ChatGPT Server URL (No authentication):\n' + connector_url(base, config))

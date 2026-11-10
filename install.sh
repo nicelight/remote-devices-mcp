@@ -5,6 +5,7 @@
 #  Targets: Linux, macOS, Windows (Git Bash) and Android/Termux (phone/tablet)
 # ==============================================================================
 set -e
+printf "[Remote Harness] Подготовка установщика / Preparing installer…\n" >&2
 
 # Defaults
 MODE=""
@@ -714,7 +715,7 @@ while [[ $# -gt 0 ]]; do
             EXPLICIT_LANG=true
             shift
             ;;
-        --pair) PAIR=true ;;
+        --pair) PAIR=true; shift ;;
         -q|--quick)
             QUICK=true
             shift
@@ -787,6 +788,50 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# Visible before DNS, interpreter discovery or the first bootstrap request.
+INSTALL_STAGE=""
+INSTALL_HEARTBEAT=""
+BOOTSTRAP_STAGE=""
+progress_stage() {
+    INSTALL_STAGE="$1"
+    printf '\n[Remote Harness] %s\n' "$INSTALL_STAGE" >&2
+}
+stop_progress() {
+    if [ -n "$INSTALL_HEARTBEAT" ]; then
+        kill "$INSTALL_HEARTBEAT" 2>/dev/null || true
+        wait "$INSTALL_HEARTBEAT" 2>/dev/null || true
+        INSTALL_HEARTBEAT=""
+    fi
+}
+install_exit() {
+    local code=$?
+    stop_progress
+    if [ -n "$BOOTSTRAP_STAGE" ]; then rm -rf "$BOOTSTRAP_STAGE"; fi
+    if [ "$code" -ne 0 ]; then
+        printf '[ERROR] %s (exit %s). Исправьте указанную ошибку и запустите установщик снова. / Fix the error above and re-run.\n' "$INSTALL_STAGE" "$code" >&2
+    fi
+}
+trap install_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+run_busy() {
+    local label="$1" elapsed=0
+    shift
+    progress_stage "$label"
+    (
+        while sleep 4; do
+            elapsed=$((elapsed + 4))
+            printf '  … %s [%ss]\n' "$label" "$elapsed" >&2
+        done
+    ) &
+    INSTALL_HEARTBEAT=$!
+    "$@"
+    local result=$?
+    stop_progress
+    return "$result"
+}
+progress_stage "Начинаем установку / Starting installation"
 
 # ------------------------------------------------------------------------------
 #  Resolve the shared domain, then fetch the node code from it.
@@ -889,8 +934,8 @@ require_gateway_dns() {
 if [ ! -f "$SCRIPT_DIR/core/agent.py" ]; then
     # The node code is fetched with curl. Piping this script through curl means curl
     # exists; arriving through wget, a copy-paste or an embedded runner does not.
-    ensure_curl || exit 1
-    require_gateway_dns || exit 1
+    run_busy "Проверка загрузчика / Checking downloader" ensure_curl || exit 1
+    run_busy "Проверка адреса Gateway / Checking Gateway DNS" require_gateway_dns || exit 1
     BOOTSTRAP_DIR="$HOME/.remote-harness-mcp"
     mkdir -p "$BOOTSTRAP_DIR/core" "$BOOTSTRAP_DIR/skills"
     # EVERY module the node can import, not a hand-picked few: the list below used to
@@ -898,42 +943,31 @@ if [ ! -f "$SCRIPT_DIR/core/agent.py" ]; then
     # then answered "the device layer (core/device.py) is missing from this checkout"
     # while the branch was advertised - the tool was there, its module was not.
     # tests/test_installer_bootstrap.py fails when a core module is missing here.
+    BOOTSTRAP_STAGE="$(mktemp -d "$BOOTSTRAP_DIR/.download.XXXXXX")"
+    mkdir -p "$BOOTSTRAP_STAGE/core" "$BOOTSTRAP_STAGE/skills"
+    downloaded_files=0
     for f in core/__init__.py core/agent.py core/agent_harness.py core/code_cache.py \
              core/device.py core/domain.py core/hooks.py core/mcp_tools.py core/paths.py \
              core/policies.py core/rekey.py core/onboarding.py \
              core/redact.py core/schemas.py core/server.py core/subagents.py core/termux.py \
              core/triggers.py core/updater.py core/version.py core/vitals.py core/web_share.py \
              skills/orchestrator.md; do
-        bootstrap_tmp="$BOOTSTRAP_DIR/${f}.part"
-        if curl -fsSL "https://${GATEWAY}/${f}" -o "$bootstrap_tmp" 2>/dev/null \
-            || curl -fsSL "https://raw.githubusercontent.com/LevRa7/remote-harness-mcp/main/${f}" -o "$bootstrap_tmp" 2>/dev/null; then
-            mv "$bootstrap_tmp" "$BOOTSTRAP_DIR/${f}"
+        bootstrap_tmp="$BOOTSTRAP_STAGE/${f}.part"
+        downloaded_files=$((downloaded_files + 1))
+        if run_busy "Загрузка / Download ${downloaded_files}/23: ${f}" \
+            curl -fSL --connect-timeout 10 --max-time 60 --silent --show-error "https://${GATEWAY}/${f}" -o "$bootstrap_tmp"; then
+            mv "$bootstrap_tmp" "$BOOTSTRAP_STAGE/${f}"
         else
             rm -f "$bootstrap_tmp"
+            printf '[ERROR] Не удалось загрузить / Could not download: %s. Проверьте Gateway и сеть. / Check Gateway and network.\n' "$f" >&2
+            exit 1
         fi
     done
     unset bootstrap_tmp
-    # A bootstrap that downloaded nothing (an unreachable gateway and no GitHub)
-    # leaves a directory that names modules which do not exist: every step after it
-    # would write a launcher for code that is not there, and the node would fail
-    # with a Python import error at boot.
-    if [ ! -f "$BOOTSTRAP_DIR/core/agent.py" ]; then
-        if [ "$LANG_CHOICE" = "ru" ]; then
-            echo -e "${RED}${BOLD}[ОШИБКА] Не удалось скачать код узла.${RESET}" >&2
-            echo -e "  Пробовали: ${CYAN}https://${GATEWAY}/core/agent.py${RESET} и ${CYAN}github.com/LevRa7/remote-harness-mcp${RESET}." >&2
-            echo -e "  Проверьте сеть и DNS либо скопируйте репозиторий на устройство и запустите из него:" >&2
-            echo -e "    ${CYAN}git clone https://github.com/LevRa7/remote-harness-mcp.git && cd remote-harness-mcp && ./install.sh --quick${RESET}" >&2
-            echo -e "  ${YELLOW}Остановка: без кода узла запускать нечего, ничего не создано.${RESET}" >&2
-        else
-            echo -e "${RED}${BOLD}[ERROR] Could not download the node code.${RESET}" >&2
-            echo -e "  Tried: ${CYAN}https://${GATEWAY}/core/agent.py${RESET} and ${CYAN}github.com/LevRa7/remote-harness-mcp${RESET}." >&2
-            echo -e "  Check the network and DNS, or put the repository on this device and install from it:" >&2
-            echo -e "    ${CYAN}git clone https://github.com/LevRa7/remote-harness-mcp.git && cd remote-harness-mcp && ./install.sh --quick${RESET}" >&2
-            echo -e "  ${YELLOW}Stopping: there is no node code to run, nothing was created.${RESET}" >&2
-        fi
-        echo ""
-        exit 1
-    fi
+    # Commit only after every required file arrived from our own Gateway.
+    cp -R "$BOOTSTRAP_STAGE/." "$BOOTSTRAP_DIR/"
+    rm -rf "$BOOTSTRAP_STAGE"
+    BOOTSTRAP_STAGE=""
     SCRIPT_DIR="$BOOTSTRAP_DIR"
 fi
 
@@ -1583,7 +1617,7 @@ if [ "$MODE" = "standalone" ]; then
         echo -e "\n${BOLD}${BLUE}=== Setting up Local Standalone FastMCP Server ===${RESET}"
         echo "[1/3] Checking Python environment..."
     fi
-    ensure_dependencies
+    run_busy "Python и зависимости / Python and dependencies" ensure_dependencies
     # The endpoint check at the end of this branch runs through curl.
     ensure_curl || exit 1
     mkdir -p "$CONFIG_DIR"
@@ -1768,7 +1802,7 @@ EOF
         printf "%s" "$MCP_LOCAL_URL" | clip.exe 2>/dev/null && COPIED=true
     fi
 
-    clear 2>/dev/null || printf "\033[2J\033[H" || true
+    [ "$PAIR" = true ] || { clear 2>/dev/null || true; }
 
     if [ "$LANG_CHOICE" = "ru" ]; then
         echo ""
@@ -1831,15 +1865,15 @@ else
     echo "[1/4] Checking Python dependencies (websockets)..."
 fi
 
-ensure_dependencies
+run_busy "Python и зависимости / Python and dependencies" ensure_dependencies
 # Registration - the step right after this - is a curl POST. A machine with a usable
 # Python and no curl (a minimal WSL image, a slim container) used to die there with
 # "curl: command not found" and no hint about what to install.
-ensure_curl || exit 1
+run_busy "Проверка загрузчика / Checking downloader" ensure_curl || exit 1
 # Registration is also the first step that truly needs the gateway: a name that does
 # not resolve here would be reported a moment later as "no authentication token",
 # which blames the gateway's answer instead of this device's DNS.
-require_gateway_dns || exit 1
+run_busy "Проверка адреса Gateway / Checking Gateway DNS" require_gateway_dns || exit 1
 
 if [ "$LANG_CHOICE" = "ru" ]; then
     echo "[2/4] Регистрация узла '${USERNAME}' на общем домене (${GATEWAY})..."
@@ -1895,7 +1929,8 @@ json_field() {
 }
 
 if [ "$PAIR" = true ]; then
-    (cd "$SCRIPT_DIR" && "$PYTHON_BIN" -m core.onboarding pair \
+    progress_stage "Google: вход и подтверждение устройства / Sign in and confirm device"
+    (cd "$SCRIPT_DIR" && "$PYTHON_BIN" -u -m core.onboarding pair \
         --gateway "https://${GATEWAY}" --config-dir "$CONFIG_DIR" --name "$USERNAME") || exit 1
     REG_RESP=$(cd "$SCRIPT_DIR" && "$PYTHON_BIN" - "$CONFIG_FILE" <<'PAIR_JSON'
 import json,sys
@@ -2060,7 +2095,8 @@ MCP_URL="$(node_sse_url "$ASSIGNED_USER" "${ASSIGNED_LINK:-$ASSIGNED_TOKEN}")"
 
 # A connector is ready only after a real command has reached this device.
 if [ "$PAIR" = true ]; then
-    (cd "$SCRIPT_DIR" && "$PYTHON_BIN" -m core.onboarding status --config-dir "$CONFIG_DIR") || exit 1
+    progress_stage "Проверка реальной связи с устройством / Verifying real device connection"
+    (cd "$SCRIPT_DIR" && "$PYTHON_BIN" -u -m core.onboarding status --config-dir "$CONFIG_DIR") || exit 1
     MCP_URL="https://${GATEWAY}/mcp?user=${ASSIGNED_USER}&token=${ASSIGNED_LINK}"
     echo "ChatGPT: add a separate MCP connector for this device; choose No authentication."
 fi
@@ -2086,9 +2122,11 @@ elif command -v clip.exe >/dev/null 2>&1; then
     printf "%s" "$MCP_URL" | clip.exe 2>/dev/null && COPIED=true
 fi
 
-clear 2>/dev/null || printf "\033[2J\033[H" || true
+[ "$PAIR" = true ] || { clear 2>/dev/null || true; }
 
 if [ "$PAIR" = true ]; then
+    progress_stage "Готово: устройство отвечает / Ready: device answered"
+    echo "Управление устройствами / Manage devices: https://${GATEWAY}/account"
     print_mcp_box "ChatGPT — private Server URL for ${ASSIGNED_USER}" "$MCP_URL" "No authentication; one connector per device"
 elif [ "$LANG_CHOICE" = "ru" ]; then
     echo ""

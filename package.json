@@ -24,7 +24,9 @@
     "README.md",
     "README_RU.md",
     "LICENSE",
-    "gateway.py"
+    "gateway.py",
+    "gateway_identity.py",
+    "requirements-gateway.txt"
   ],
   "keywords": [
     "gemini",

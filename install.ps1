@@ -15,6 +15,8 @@ param(
     [switch]$DryRun
 )
 
+Write-Host "[Remote Harness] Начинаем установку / Starting installation" -ForegroundColor Cyan
+
 # Ensure UTF-8 output encoding in PowerShell console
 try {
     [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -255,16 +257,19 @@ function Install-WebsocketsFor {
     if (Test-PythonWebsockets $Python) { return @{ Ok = $true; Python = $Python } }
 
     # 1. plain pip, after upgrading it: an old pip cannot find or build wheels.
+    Write-Host "[Dependencies] pip: подготовка и загрузка websockets / preparing and downloading websockets"
     & $Python -m pip install --disable-pip-version-check --quiet --upgrade pip 2>&1 | Out-Null
     & $Python -m pip install --disable-pip-version-check --quiet websockets 2>&1 | Out-Null
     if (Test-PythonWebsockets $Python) { return @{ Ok = $true; Python = $Python } }
 
     # 2. --user: site-packages is read-only, the profile is not.
+    Write-Host "[Dependencies] pip --user: пробуем установку в профиль / trying user installation"
     & $Python -m pip install --disable-pip-version-check --quiet --user websockets 2>&1 | Out-Null
     if (Test-PythonWebsockets $Python) { return @{ Ok = $true; Python = $Python } }
 
     # 3. ensurepip: a per-user install lands without pip when the feature set was
     #    trimmed, or when the launcher is disabled by policy.
+    Write-Host "[Dependencies] Восстановление pip / Repairing pip"
     & $Python -m ensurepip --default-pip 2>&1 | Out-Null
     & $Python -m pip install --disable-pip-version-check --quiet websockets 2>&1 | Out-Null
     if (Test-PythonWebsockets $Python) { return @{ Ok = $true; Python = $Python } }
@@ -840,16 +845,30 @@ if (-not $ScriptDir -or -not (Test-Path "$ScriptDir\core\agent.py")) {
         "ops/update.ps1",
         "ops/doctor.ps1"
     )
+    $DownloadStage = Join-Path $BootstrapDir (".download." + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $DownloadStage -Force -ErrorAction Stop | Out-Null
+    $downloadedFiles = 0
     foreach ($f in $files) {
-        $dest = "$BootstrapDir\$($f -replace '/', '\')"
+        $downloadedFiles++
+        Write-Progress -Activity "Remote Harness: загрузка компонентов / Downloading components" -Status "$downloadedFiles/$($files.Count): $f" -PercentComplete (100 * $downloadedFiles / $files.Count)
+        Write-Host "[Download $downloadedFiles/$($files.Count)] $f"
+        $dest = "$DownloadStage\$($f -replace '/', '\')"
         try {
-            Invoke-WebRequest -Uri "https://$Gateway/$f" -OutFile $dest -UseBasicParsing -ErrorAction Stop
+            New-Item -ItemType Directory -Path (Split-Path -Parent $dest) -Force -ErrorAction Stop | Out-Null
+            Invoke-WebRequest -Uri "https://$Gateway/$f" -OutFile "$dest.part" -TimeoutSec 60 -UseBasicParsing -ErrorAction Stop
+            Move-Item -LiteralPath "$dest.part" -Destination $dest -Force -ErrorAction Stop
         } catch {
-            try {
-                Invoke-WebRequest -Uri "https://raw.githubusercontent.com/LevRa7/remote-harness-mcp/main/$f" -OutFile $dest -UseBasicParsing
-            } catch {}
+            Remove-Item -LiteralPath $DownloadStage -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Host "[ERROR] Could not download $f from Gateway. Check network and re-run." -ForegroundColor Red
+            exit 1
         }
     }
+    try {
+        Copy-Item -Path "$DownloadStage\*" -Destination $BootstrapDir -Recurse -Force -ErrorAction Stop
+    } finally {
+        Remove-Item -LiteralPath $DownloadStage -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Write-Progress -Activity "Remote Harness: загрузка компонентов / Downloading components" -Completed
     $ScriptDir = $BootstrapDir
 }
 
@@ -904,7 +923,7 @@ if ($Mode -eq "standalone") {
         try { $LocalUrl | clip.exe 2>$null; $Copied = $true } catch {}
     }
 
-    Clear-Host
+    if (-not $Pair) { Clear-Host }
 
 if ($Pair) {
     Print-McpBox "ChatGPT - private Server URL for $AssignedUser" $SseUrl "No authentication; one connector per device"
@@ -979,7 +998,7 @@ if (-not [string]::IsNullOrWhiteSpace($Token)) {
 if ($Pair) {
     Push-Location $ScriptDir
     try {
-        & $pyExeOnly -m core.onboarding pair --gateway "https://$Gateway" --config-dir $ConfigDir --name $User
+        & $pyExeOnly -u -m core.onboarding pair --gateway "https://$Gateway" --config-dir $ConfigDir --name $User
         if ($LASTEXITCODE -ne 0) { exit 1 }
         $paired = @{}
         Get-Content "$ConfigDir\agent.env" | ForEach-Object {
@@ -1293,15 +1312,19 @@ Start-Process $pyExeOnly -ArgumentList "-u -m core.agent" -WorkingDirectory $Scr
 if ($Pair) {
     Push-Location $ScriptDir
     try {
-        & $pyExeOnly -m core.onboarding status --config-dir $ConfigDir
+        & $pyExeOnly -u -m core.onboarding status --config-dir $ConfigDir
         if ($LASTEXITCODE -ne 0) { exit 1 }
     } finally { Pop-Location }
     Write-Host "ChatGPT: add a separate connector for this device; choose No authentication."
 }
 
-Clear-Host
+if (-not $Pair) { Clear-Host }
 
-if ($Lang -eq "ru") {
+if ($Pair) {
+    Write-Host "[OK] Устройство отвечает / Device answered" -ForegroundColor Green
+    Write-Host "Управление устройствами / Manage devices: https://$Gateway/account"
+    Print-McpBox "ChatGPT - private Server URL for $AssignedUser" $SseUrl "No authentication; one connector per device"
+} elseif ($Lang -eq "ru") {
     Write-Host ""
     $copyMsg = if ($Copied) { "[OK] ССЫЛКА СКОПИРОВАНА В БУФЕР ОБМЕНА! (Вставьте через Ctrl+V)" } else { "Скопируйте ссылку выше" }
     Print-McpBox "ССЫЛКА MCP-СЕРВЕРА ДЛЯ ПОДКЛЮЧЕНИЯ (СКОПИРУЙТЕ):" $SseUrl $copyMsg

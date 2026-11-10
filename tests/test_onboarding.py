@@ -66,9 +66,18 @@ def test_doctor_uses_device_header_and_correct_node(monkeypatch):
     assert 'actual-host' in ob.verify_device('https://gw.example',{'MESH_USER':'one','MESH_TOKEN':'device-token'})
 
 
-def test_expired_pair_stops_without_touching_device_config(tmp_path):
+def test_expired_pair_creates_fresh_request(tmp_path, monkeypatch):
     ob.private_write(tmp_path/'onboarding.pending.json', json.dumps({'gateway':'https://gw.example',
-        'pair_code':'expired','device_secret':'poll','expires_at':0}))
-    with pytest.raises(ob.OnboardingError, match='expired'):
-        ob.pair('https://gw.example',tmp_path,'phone',open_browser=False)
-    assert not (tmp_path/'agent.env').exists()
+        'pair_code':'expired','device_secret':'old-secret','expires_at':0}))
+    calls = []
+    def request(base, path, **kwargs):
+        calls.append(path)
+        if path.endswith('/pair'):
+            return {'pair_code':'ABCD-EFGH','device_secret':'new-secret','expires_in':600}
+        assert kwargs['headers']['X-Pair-Secret'] == 'new-secret'
+        return {'status':'approved','username':'phone','token':'new-token','link_key':'lk_new'}
+    monkeypatch.setattr(ob, 'request_json', request)
+    config = ob.pair('https://gw.example', tmp_path, 'phone', open_browser=False)
+    assert config['MESH_USER'] == 'phone'
+    assert calls == ['/v1/devices/pair', '/v1/devices/pair/ABCD-EFGH']
+    assert not (tmp_path/'onboarding.pending.json').exists()

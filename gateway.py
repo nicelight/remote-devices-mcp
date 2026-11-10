@@ -14,15 +14,16 @@ import shutil
 import socket
 import time
 import uuid
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlencode
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response, StreamingResponse
+from starlette.responses import JSONResponse, Response, StreamingResponse, RedirectResponse
 from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
 import uvicorn
+from gateway_identity import OwnerAuth, page, escape, fields, form_fields
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("gateway")
@@ -31,7 +32,7 @@ logger = logging.getLogger("gateway")
 # every MCP call used to put the node credential on disk. Redacting at the record
 # level keeps the rest of the line (status, client, latency) and removes the
 # secret, whether it is a link key or a pre-0.4.6 device token.
-_TOKEN_IN_QUERY = re.compile(r"(token=)[^&\s\"']+")
+_TOKEN_IN_QUERY = re.compile(r"((?:token|code|state)=)[^&\s\"']+")
 
 
 class CredentialRedactionFilter(logging.Filter):
@@ -728,7 +729,7 @@ def enrolment_refusal(request: Request) -> str:
     pairing endpoints as the only way in. ``MESH_ENROLL_SECRET`` keeps
     self-registration but requires a shared secret the installer was given.
     """
-    if REGISTER_MODE == "pair":
+    if REGISTER_MODE == "pair" or owner_auth.configured:
         return (
             "Self-registration is disabled on this gateway (MESH_REGISTER_MODE=pair). "
             "Start a pairing with POST /v1/devices/pair and approve the code."
@@ -902,7 +903,7 @@ async def api_register(request: Request):
 # The join flow that replaces "anyone may POST /api/register and receive a token":
 #
 #   1. the node asks for a code            POST /v1/devices/pair
-#   2. a human with admin rights approves  POST /v1/devices/pair/{code}/approve
+#   2. an authenticated owner confirms in /pair (or an admin uses the API)
 #   3. the node collects its credentials   GET  /v1/devices/pair/{code}
 #
 # Credentials are issued once; the initiating device may retry delivery until the code dies
@@ -914,6 +915,7 @@ PAIR_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"   # no 0/O/1/I confusables
 ADMIN_TOKEN = os.environ.get("MESH_ADMIN_TOKEN", "").strip()
 
 pending_pairs: dict[str, dict] = {}
+owner_auth = OwnerAuth(PUBLIC_BASE_URL)
 
 
 def admin_authorised(request: Request) -> bool:
@@ -970,16 +972,13 @@ async def device_pair_start(request: Request):
         "collected": False,
         "attempts": 0,
     }
-    logger.info("Pairing code %s issued (host=%s)", code, pending_pairs[code]["hostname"] or "?")
+    logger.info("Device pairing request created")
     return JSONResponse({
         "pair_code": code,
         "device_secret": device_secret,
         "pair_url": f"{PUBLIC_BASE_URL}/pair?code={code}",
         "expires_in": PAIR_TTL_SECONDS,
-        "message": (
-            "Approve this code with POST /v1/devices/pair/{code}/approve and an "
-            "X-Admin-Token header, then collect the credentials from this endpoint."
-        ),
+        "message": "Open pair_url, sign in and confirm the device. No admin key is needed in the browser.",
     }, status_code=201, headers={"Cache-Control": "no-store"})
 
 
@@ -997,14 +996,19 @@ async def device_pair_status(request: Request):
         return JSONResponse({
             "status": "pending",
             "expires_in": max(0, int(pair["expires_at"] - time.time())),
-        })
+        }, headers={"Cache-Control": "no-store"})
     supplied = request.headers.get("x-pair-secret", "")
     if not supplied or not tokens_equal(hash_secret(supplied), pair["device_secret_sha256"]):
         return JSONResponse({"error": "pair_secret_required"}, status_code=403)
     # Same device may retry a lost HTTP response until TTL. No second node/token
     # is created, and knowing the short human code never reveals credentials.
-    pair["collected"] = True
     issued = pair.get("issued") or {}
+    entry = load_registry().get(issued.get('username'))
+    if not entry or not token_matches_device(entry, issued.get('token', '')):
+        return JSONResponse({'error': 'pair_revoked'}, status_code=410, headers={'Cache-Control': 'no-store'})
+    pair["collected"] = True
+    # A link may have been rotated in the owner UI while installation waited.
+    issued = {**issued, 'link_key': entry['link_key'], 'sse_url': node_mcp_url(issued['username'], entry['link_key'])}
     return JSONResponse({"status": "approved", **issued}, headers={"Cache-Control": "no-store"})
 
 
@@ -1030,6 +1034,12 @@ async def device_pair_approve(request: Request):
         data = {}
     if not isinstance(data, dict):
         data = {}
+    wanted = approve_pair(code, pair, data)
+    return JSONResponse({"status": "approved", "username": wanted}, headers={"Cache-Control": "no-store"})
+
+
+def approve_pair(code, pair, data, owner_subject=None):
+    """No await between read/issue/save: one worker serialises identity issuance."""
     wanted = re.sub(r"[^a-z0-9_-]", "", str(data.get("username") or pair.get("hostname") or "node").lower())[:40]
     if not wanted or len(wanted) < 2:
         wanted = "node"
@@ -1041,10 +1051,13 @@ async def device_pair_approve(request: Request):
     now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
     entry = new_node_entry("", pair["os"], pair["arch"], now_iso, token)
     entry["hostname"] = pair["hostname"]
+    if owner_subject:
+        entry["owner_subject"] = owner_subject
     registry[wanted] = entry
     save_registry(registry)
 
     pair["approved"] = True
+    pair["owner_subject"] = owner_subject
     pair["issued"] = {
         "username": wanted,
         "token": token,
@@ -1054,8 +1067,8 @@ async def device_pair_approve(request: Request):
         "tunnel_url": f"wss://{PUBLIC_HOST}/ws/tunnel?user={wanted}",
         "token_use": "Authorization: Bearer <token> (the tunnel and CLI use this; never in a URL)",
     }
-    logger.info("Paired node '%s' from code %s", wanted, code)
-    return JSONResponse({"status": "approved", "username": wanted})
+    logger.info("Paired node '%s'", wanted)
+    return wanted
 
 
 async def device_rotate(request: Request):
@@ -1166,6 +1179,10 @@ async def device_revoke(request: Request):
     supplied, _source = request_credential(request)
     if not (admin_authorised(request) or token_matches_device(entry, supplied)):
         return JSONResponse({"error": "forbidden"}, status_code=403)
+    return await revoke_node(user, registry)
+
+
+async def revoke_node(user, registry):
     registry.pop(user, None)
     save_registry(registry)
     tunnel = active_tunnels.pop(user, None)
@@ -1184,49 +1201,111 @@ async def device_revoke(request: Request):
 
 
 async def pairing_page(request: Request):
-    """Human confirmation for the existing admin-approved pairing protocol."""
-    import html
     purge_pairs()
-    code = (request.query_params.get("code") or "").upper().strip()
+    code = (request.query_params.get('code') or '').upper().strip()
     pair = pending_pairs.get(code)
     if not pair:
-        return Response("Pairing code missing or expired. Run the installer again.", status_code=404)
-    nonce = secrets.token_urlsafe(24)
-    code_json = json.dumps(code)
-    body = '''<!doctype html><html lang="ru"><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Remote Harness — привязка устройства</title>
-<body><main><h1>Привязка устройства</h1>
-<p>Устройство: <strong>HOSTNAME</strong> · OSNAME</p>
-<p>Проверьте, что код <strong>PAIRCODE</strong> совпадает с кодом в установщике.</p>
-<p>Подтверждение выполняет администратор Gateway. Не передавайте его ключ владельцу устройства.
-После подтверждения установщик сам сохранит настройки, запустит агент и проверит связь.</p>
-<p>Доступ позволяет выполнять команды и изменять файлы от имени пользователя агента.
-Один коннектор управляет только этим устройством.</p>
-<form id="approve"><label>Ключ администратора <input id="key" type="password" required autocomplete="off"></label>
-<button>Подтвердить устройство</button></form><p id="status" role="status"></p>
-<script nonce="NONCE">
-const code=CODE_JSON;
-document.getElementById('approve').addEventListener('submit',async e=>{
- e.preventDefault(); const field=document.getElementById('key'); const secret=field.value; field.value='';
- const status=document.getElementById('status');
- try {
-  const response=await fetch('/v1/devices/pair/'+encodeURIComponent(code)+'/approve',{
-   method:'POST',headers:{'Content-Type':'application/json','X-Admin-Token':secret},body:'{}'});
-  if(!response.ok){status.textContent='Подтверждение отклонено (HTTP '+response.status+'). Проверьте ключ и срок действия кода.';return;}
-  const result=await response.json(); document.getElementById('approve').hidden=true;
-  status.textContent='Привязка подтверждена: '+result.username+'. Вернитесь к установщику и дождитесь проверки соединения.';
- } catch(error){status.textContent='Не удалось связаться с Gateway. Попробуйте ещё раз.';}
-});
-</script></main></body></html>'''
-    # Escape untrusted device metadata; never reflect host headers or credentials.
-    body = body.replace('HOSTNAME', html.escape(pair['hostname'])).replace('OSNAME', html.escape(pair['os']))
-    body = body.replace('PAIRCODE', html.escape(code)).replace('NONCE', nonce).replace('CODE_JSON', code_json)
-    return Response(body, media_type='text/html', headers={
-        'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer',
-        'X-Content-Type-Options': 'nosniff',
-        'Content-Security-Policy': f"default-src 'none'; script-src 'nonce-{nonce}'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
-    })
+        return page('Ссылка истекла', '<p>Заявка действует 10 минут. Запустите установщик ещё раз. При перезапуске Gateway нужно начать новую привязку.</p>', status=404)
+    owner = owner_auth.owner(request)
+    if pair['approved']:
+        if owner and pair.get('owner_subject') == owner['subject']:
+            return RedirectResponse('/account', status_code=303)
+        return page('Заявка уже подтверждена', '<p>Вернитесь к установщику. Если это сделали не вы, не продолжайте установку и сообщите владельцу Gateway.</p>', status=409)
+    metadata = f'<p>Устройство <strong>{escape(pair["hostname"])}</strong><br><span class="muted">{escape(pair["os"])} · {escape(pair["arch"])}</span></p>'
+    steps = '<ol class="steps"><li>1. Установка</li><li aria-current="step">2. Подключение</li><li>3. Проверка связи</li></ol>'
+    detail = f'<details><summary>Сверить код устройства</summary><p class="code">{escape(code)}</p><p>Вводить код не нужно. При желании сверьте его с установщиком.</p></details>'
+    if not owner:
+        if owner_auth.configured:
+            action = f'<p>Войдите, чтобы сохранить устройство в своём аккаунте.</p><a class="button" href="{escape(owner_auth.login_link(code))}">Войти через Google</a>'
+        else:
+            action = '<p class="notice">Google OAuth ещё не настроен владельцем Gateway. Передайте ему адрес этой страницы. Административный ключ вводить не нужно.</p>'
+        return page('Подключите устройство', steps + metadata + action + detail)
+    content = steps + metadata + f'<p>Вы вошли как <strong>{escape(owner["email"])}</strong>.</p>'
+    content += '<p class="notice">Подключайте только своё устройство. Коннектор сможет выполнять команды и изменять файлы с правами пользователя, запустившего агент.</p>'
+    content += f'<form method="post" action="/account/pair/{escape(code)}/approve">{form_fields(owner["csrf"])}<button>Подключить устройство</button></form>'
+    content += f'<div class="actions"><form method="post" action="/auth/logout">{form_fields(owner["csrf"])}<input type="hidden" name="return_code" value="{escape(code)}"><button class="secondary">Сменить аккаунт</button></form></div>' + detail
+    return page('Это ваше устройство?', content)
+
+
+async def owner_login(request: Request):
+    if rate_limited('owner_login', client_ip(request), limit=20):
+        return page('Подождите минуту', '<p>Слишком много попыток входа с этого адреса.</p>', status=429)
+    return await owner_auth.login(request)
+
+
+async def owner_pair_approve(request: Request):
+    owner = owner_auth.owner(request)
+    data = await fields(request)
+    if not owner_auth.csrf_ok(request, owner, data):
+        return page('Подтверждение отклонено', '<p>Войдите через Google заново и повторите подтверждение со страницы устройства.</p>', status=403)
+    purge_pairs()
+    code = request.path_params['code']
+    pair = pending_pairs.get(code)
+    if not pair:
+        return page('Ссылка истекла', '<p>Запустите установщик ещё раз.</p>', status=404)
+    if pair['approved']:
+        if pair.get('owner_subject') != owner['subject']:
+            return page('Заявка уже подтверждена', '<p>Устройство привязано к другому аккаунту.</p>', status=409)
+    else:
+        approve_pair(code, pair, {}, owner['subject'])
+    return RedirectResponse('/account', status_code=303, headers={'Cache-Control': 'no-store'})
+
+
+async def owner_account(request: Request):
+    owner = owner_auth.owner(request)
+    if not owner:
+        return page('Ваши устройства', '<p>Войдите, чтобы получить ссылки подключений и управлять доступом.</p>'
+                    f'<a class="button" href="{owner_auth.login_link()}">Войти через Google</a>')
+    content = f'<p>{escape(owner["email"])}</p><p>После подтверждения дождитесь сообщения об успешной проверке в установщике. Затем создайте в ChatGPT отдельный MCP-коннектор для устройства: вставьте Server URL и выберите <strong>No authentication</strong>.</p>'
+    devices = [(user, entry) for user, entry in load_registry().items() if entry.get('owner_subject') == owner['subject']]
+    if not devices:
+        content += '<p class="notice">Устройств пока нет. Запустите установщик на нужном устройстве и откройте его ссылку.</p>'
+    for user, entry in devices:
+        link = PUBLIC_BASE_URL + '/mcp?' + urlencode({'user': user, 'token': entry['link_key']})
+        content += f'<article class="device"><h2>{escape(entry.get("hostname") or user)}</h2><p class="muted">{escape(user)} · {escape(entry.get("os", ""))}</p>'
+        content += f'<label for="url-{escape(user)}">Приватный Server URL</label><textarea id="url-{escape(user)}" rows="3" readonly spellcheck="false">{escape(link)}</textarea>'
+        content += f'<button class="secondary copy" data-target="url-{escape(user)}">Скопировать ссылку</button><div class="actions">'
+        for action, label in [('check', 'Проверить связь'), ('rotate', 'Заменить ссылку'), ('revoke', 'Отозвать доступ')]:
+            content += f'<form method="post" action="/account/devices/{escape(user)}/{action}">{form_fields(owner["csrf"])}<button class="secondary">{label}</button></form>'
+        content += '</div></article>'
+    content += f'<div class="actions"><form method="post" action="/auth/logout">{form_fields(owner["csrf"])}<button class="secondary">Выйти</button></form></div><p id="status" role="status" aria-live="polite"></p>'
+    script = """document.querySelectorAll('.copy').forEach(button=>button.addEventListener('click',async()=>{
+const field=document.getElementById(button.dataset.target);const status=document.getElementById('status');
+try{await navigator.clipboard.writeText(field.value);status.textContent='Ссылка скопирована. Вставьте её в Server URL в ChatGPT.';}
+catch(error){field.focus();field.select();status.textContent='Скопируйте выделенную ссылку вручную.';}}));"""
+    return page('Ваши устройства', content, script=script)
+
+
+async def owner_device_action(request: Request):
+    owner = owner_auth.owner(request)
+    data = await fields(request)
+    if not owner_auth.csrf_ok(request, owner, data):
+        return page('Действие отклонено', '<p>Сеанс истёк или страница устарела. Войдите и повторите действие.</p>', status=403)
+    registry = load_registry()
+    user = request.path_params['user']
+    entry = registry.get(user)
+    if not entry or entry.get('owner_subject') != owner['subject']:
+        return page('Устройство не найдено', '<p>Нет доступа к этому устройству.</p>', status=404)
+    action = request.path_params['action']
+    back = '<p><a href="/account">К устройствам</a></p>'
+    if action == 'check':
+        result = await call_remote_tool(user, 'mesh_status', {})
+        error = remote_tool_error(result)
+        if error or not result.get('agent_pid'):
+            return page('Устройство пока не отвечает', '<p>Дождитесь окончания установки. Если агент уже установлен, запустите диагностику status на устройстве и проверьте его службу.</p>' + back, status=503)
+        return page('Связь подтверждена', f'<p>Получен реальный ответ агента на {escape(result.get("hostname", user))}.</p>' + back)
+    if action not in {'rotate', 'revoke'}:
+        return page('Неизвестное действие', back, status=404)
+    if data.get('confirm') != 'yes':
+        explanation = 'Все коннекторы с прежней ссылкой перестанут работать. Агент останется подключён.' if action == 'rotate' else 'Агент и все коннекторы потеряют доступ. Для восстановления потребуется новая привязка устройства.'
+        return page('Заменить ссылку?' if action == 'rotate' else 'Отозвать доступ?',
+            f'<p>{escape(entry.get("hostname") or user)}</p><p>{explanation}</p><form method="post">{form_fields(owner["csrf"])}<input type="hidden" name="confirm" value="yes"><button>Подтвердить</button></form>' + back)
+    if action == 'rotate':
+        entry['link_key'] = new_link_key()
+        save_registry(registry)
+    else:
+        await revoke_node(user, registry)
+    return RedirectResponse('/account', status_code=303, headers={'Cache-Control': 'no-store'})
 
 
 async def installer_asset(request: Request):
@@ -3382,6 +3461,12 @@ routes = [
     Route("/health", health, methods=["GET", "HEAD", "OPTIONS"]),
     Route("/health-mesh", health, methods=["GET", "HEAD", "OPTIONS"]),
     Route("/pair", pairing_page, methods=["GET"]),
+    Route("/auth/google/login", owner_login, methods=["GET"]),
+    Route("/auth/google/callback", owner_auth.callback, methods=["GET"]),
+    Route("/auth/logout", owner_auth.logout, methods=["POST"]),
+    Route("/account", owner_account, methods=["GET"]),
+    Route("/account/pair/{code}/approve", owner_pair_approve, methods=["POST"]),
+    Route("/account/devices/{user}/{action}", owner_device_action, methods=["POST"]),
     Route("/install.sh", installer_asset, methods=["GET", "HEAD"]),
     Route("/install.ps1", installer_asset, methods=["GET", "HEAD"]),
     Route("/core/{filename}", installer_asset, methods=["GET", "HEAD"]),
@@ -3392,7 +3477,7 @@ routes = [
     Route("/ops/doctor.ps1", installer_asset, methods=["GET", "HEAD"]),
     Route("/api/register", api_register, methods=["POST", "OPTIONS"]),
     # Device pairing: the join flow that does not hand a token to an anonymous
-    # caller. Credentials are issued only after an admin approves the code.
+    # caller. Credentials are issued only after owner/admin confirmation.
     Route("/v1/devices", device_pair_start, methods=["POST", "OPTIONS"]),
     Route("/v1/devices/pair", device_pair_start, methods=["POST", "OPTIONS"]),
     Route("/v1/devices/pair/{code}", device_pair_status, methods=["GET", "OPTIONS"]),
@@ -3467,6 +3552,7 @@ async def tunnel_watchdog():
 async def lifespan(_app):
     """Start the self-healing watchdog with the app (modern Starlette API)."""
     # All tunnel state belongs to ONE process. Fail closed under --workers N.
+    owner_auth.validate_config()
     lock = None
     if os.name == "posix":
         import fcntl

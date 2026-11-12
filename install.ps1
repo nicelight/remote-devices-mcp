@@ -3,7 +3,7 @@
 # ==============================================================================
 param(
     [switch]$Quick,
-    [switch]$Pair,
+    [switch]$Pair = $true,
     [string]$Mode = "tunnel",
     [string]$User = "",
     [string]$Token = "",
@@ -556,7 +556,10 @@ $ConfigDirDefault = "$env:USERPROFILE\.config\remote-harness-mcp"
 $LegacyConfigDir = "$env:USERPROFILE\.config\antigravity-mesh"
 if (-not (Test-Path $ConfigDirDefault) -and (Test-Path $LegacyConfigDir)) { $ConfigDirDefault = $LegacyConfigDir }
 $DomainFilePath = if ($env:MESH_DOMAIN_FILE) { $env:MESH_DOMAIN_FILE } else { "$ConfigDirDefault\domain.env" }
+# Default installation creates the client on THIS Windows host. Saved config wins
+# over ambient defaults; an explicit -Gateway is checked by onboarding before writes.
 $ResolvedDomain = Get-NormalisedHost $Gateway
+if (-not $ResolvedDomain) { $ResolvedDomain = Get-NormalisedHost (Get-DomainFileValue "$ConfigDirDefault\agent.env") }
 if (-not $ResolvedDomain) { $ResolvedDomain = Get-NormalisedHost $env:MESH_PUBLIC_URL }
 if (-not $ResolvedDomain) { $ResolvedDomain = Get-NormalisedHost $env:AGY_PUBLIC_BASE_URL }
 if (-not $ResolvedDomain) { $ResolvedDomain = Get-NormalisedHost (Get-DomainFileValue $DomainFilePath) }
@@ -925,9 +928,7 @@ if ($Mode -eq "standalone") {
 
     if (-not $Pair) { Clear-Host }
 
-if ($Pair) {
-    Print-McpBox "ChatGPT - private Server URL for $AssignedUser" $SseUrl "No authentication; one connector per device"
-} elseif ($Lang -eq "ru") {
+if ($Lang -eq "ru") {
     Write-Host ""
     $copyMsg = if ($Copied) { "[OK] ССЫЛКА СКОПИРОВАНА В БУФЕР ОБМЕНА! (Вставьте через Ctrl+V)" } else { "Скопируйте ссылку выше" }
     Print-McpBox "ССЫЛКА ЛОКАЛЬНОГО MCP-СЕРВЕРА (СКОПИРУЙТЕ):" $LocalUrl $copyMsg

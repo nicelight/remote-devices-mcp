@@ -1334,12 +1334,10 @@ async def installer_asset(request: Request):
     if relative == 'install.sh':
         text = payload.decode('utf-8')
         text = re.sub(r'^PUBLISHED_DOMAIN=.*$', lambda m: 'PUBLISHED_DOMAIN=' + json.dumps(PUBLIC_HOST), text, flags=re.MULTILINE)
-        text = text.replace('PAIR=false', 'PAIR=true', 1)
         payload = text.encode('utf-8')
     elif relative == 'install.ps1':
         text = payload.decode('utf-8-sig')
         text = re.sub(r'(?m)^(\s*)\$PublishedDomain = .*$', lambda m: m[1] + '$PublishedDomain = ' + json.dumps(PUBLIC_HOST), text)
-        text = text.replace('[switch]$Pair,', '[switch]$Pair = $true,', 1)
         payload = ('\ufeff' + text).encode('utf-8')
     return Response(payload if request.method != 'HEAD' else b'', media_type='text/plain',
                     headers={'Cache-Control': 'no-cache', 'X-Content-Type-Options': 'nosniff',

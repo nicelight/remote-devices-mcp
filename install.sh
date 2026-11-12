@@ -8,7 +8,7 @@ set -e
 printf "[Remote Harness] Подготовка установщика / Preparing installer…\n" >&2
 
 # Defaults
-MODE=""
+MODE="tunnel"
 TLS="none"
 PORT="8096"
 DOMAIN=""
@@ -16,7 +16,7 @@ GATEWAY=""
 USERNAME=""
 TOKEN=""
 DRY_RUN=false
-PAIR=false
+PAIR=true
 QUICK=false
 SSH_TARGET=""
 SSH_PORT="22"
@@ -178,6 +178,12 @@ resolve_domain() {
     local explicit_value="${1:-}" candidate=""
     if [ -n "$explicit_value" ]; then
         printf '%s' "$(normalise_host "$explicit_value")"
+        return 0
+    fi
+    # Reinstallation belongs to this host and retains its saved Gateway.
+    candidate="$(domain_file_value "$CONFIG_FILE")"
+    if [ -n "$candidate" ]; then
+        printf '%s' "$(normalise_host "$candidate")"
         return 0
     fi
     for candidate in "${MESH_PUBLIC_URL:-}" "${AGY_PUBLIC_BASE_URL:-}"; do
@@ -767,8 +773,10 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -h|--help)
-            echo "Usage: $0 [--lang=en|ru] [-q|--quick] [--mode=tunnel|standalone|gateway] [--user=<node-name>] [--token=<token>] [--domain=<shared-domain>] [--port=<port>] [--ssh=user@host] [--dry-run] [--pair]"
+            echo "Usage: $0 [--lang=en|ru] [-q|--quick] [--mode=tunnel|standalone] [--user=<node-name>] [--token=<token>] [--domain=<shared-domain>] [--port=<port>] [--ssh=user@host] [--dry-run] [--pair]"
             echo ""
+            echo "Default: install the client agent on THIS host; reuse its saved identity and configuration."
+            echo "Gateway is an existing remote server. --user names this host; --ssh explicitly selects a remote host."
             echo "All nodes use ONE shared domain; the node is selected by ?user=<node-name>:"
             echo "  MCP URL: https://<shared-domain>/sse?user=<node-name>&token=<token>"
             echo ""
@@ -1929,6 +1937,7 @@ json_field() {
 }
 
 if [ "$PAIR" = true ]; then
+    echo "Клиент — текущий хост / Client is this host: $DETECTED_HOSTNAME"
     progress_stage "Google: вход и подтверждение устройства / Sign in and confirm device"
     (cd "$SCRIPT_DIR" && "$PYTHON_BIN" -u -m core.onboarding pair \
         --gateway "https://${GATEWAY}" --config-dir "$CONFIG_DIR" --name "$USERNAME") || exit 1

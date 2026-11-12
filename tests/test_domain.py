@@ -65,9 +65,9 @@ def _write_domain_file(path: Path, text: str, bom: bool = False) -> str:
 
 def test_default_when_nothing_is_configured():
     assert domain.public_base_url() == domain.DEFAULT_PUBLIC_BASE_URL
-    assert domain.public_base_url() == "https://smart-server.online"
-    assert domain.public_host() == "smart-server.online"
-    assert domain.gateway_host() == "smart-server.online"
+    assert domain.public_base_url() == "https://mcp.natureonzoom.win"
+    assert domain.public_host() == "mcp.natureonzoom.win"
+    assert domain.gateway_host() == "mcp.natureonzoom.win"
     assert domain.source() == "default"
     assert domain.is_explicit() is False
 
@@ -317,9 +317,9 @@ def test_the_domain_literal_lives_in_exactly_one_module():
     offenders = [
         name
         for name in components
-        if "smart-server.online" in (root / name).read_text(encoding="utf-8")
+        if "mcp.natureonzoom.win" in (root / name).read_text(encoding="utf-8")
     ]
     assert offenders == [], (
         "the public domain must only be declared in core/domain.py, found in: %s" % offenders
     )
-    assert "smart-server.online" in (root / "core" / "domain.py").read_text(encoding="utf-8")
+    assert "mcp.natureonzoom.win" in (root / "core" / "domain.py").read_text(encoding="utf-8")

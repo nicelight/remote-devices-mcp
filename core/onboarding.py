@@ -242,7 +242,7 @@ def verify_device(base, config, timeout=40, announce=None):
 def main(argv=None):
     parser = argparse.ArgumentParser(description='Pair a device, check real MCP connectivity, or show its private ChatGPT link.')
     parser.add_argument('action', choices=['pair', 'status', 'link'])
-    parser.add_argument('--gateway', default=domain.public_base_url())
+    parser.add_argument('--gateway', default=None)
     parser.add_argument('--config-dir', default=paths.config_dir())
     parser.add_argument('--name', default=socket.gethostname())
     parser.add_argument('--timeout', type=int, default=None)
@@ -251,7 +251,8 @@ def main(argv=None):
     parser.add_argument('--result-file', help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     try:
-        base = gateway_url(args.gateway, args.allow_local_http)
+        saved = domain.read_env_file(str(Path(args.config_dir) / 'agent.env'))
+        base = gateway_url(args.gateway or saved.get('MESH_PUBLIC_URL') or domain.public_base_url(), args.allow_local_http)
         if args.action == 'pair':
             receipt = Path(args.config_dir) / 'onboarding.receipt.json'
             if receipt.exists() and not (Path(args.config_dir) / 'agent.env').exists():

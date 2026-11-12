@@ -46,7 +46,7 @@ from urllib.parse import urlparse
 from core import paths
 
 #: The project default. Declared exactly once; every other module asks for it.
-DEFAULT_PUBLIC_BASE_URL = "https://smart-server.online"
+DEFAULT_PUBLIC_BASE_URL = "https://mcp.natureonzoom.win"
 
 #: Neutral placeholder for *display* in an unconfigured deployment. It is not a
 #: usable address and is never used to build a URL that a caller is expected to

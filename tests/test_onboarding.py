@@ -81,3 +81,30 @@ def test_expired_pair_creates_fresh_request(tmp_path, monkeypatch):
     assert config['MESH_USER'] == 'phone'
     assert calls == ['/v1/devices/pair', '/v1/devices/pair/ABCD-EFGH']
     assert not (tmp_path/'onboarding.pending.json').exists()
+
+
+def test_cli_uses_current_hostname_for_new_client(tmp_path, monkeypatch):
+    monkeypatch.setattr(ob.socket, 'gethostname', lambda: 'current-test-host')
+    seen = []
+    def fake_pair(base, root, name, **kwargs):
+        seen.append((base, root, name))
+        return {}
+    monkeypatch.setattr(ob, 'pair', fake_pair)
+    assert ob.main(['pair', '--config-dir', str(tmp_path), '--no-browser']) == 0
+    assert seen == [(ob.domain.public_base_url(), str(tmp_path), 'current-test-host')]
+
+
+def test_reinstall_retains_identity_gateway_and_custom_settings(tmp_path, monkeypatch):
+    original = ('MESH_PUBLIC_URL=https://saved.example\nMESH_USER=original-host\n'
+                'MESH_TOKEN=device-secret\nMESH_LINK_KEY=lk_private\n'
+                'MESH_READ_ONLY=1\nMESH_WORKSPACE=/custom/workspace\n')
+    ob.private_write(tmp_path / 'agent.env', original)
+    monkeypatch.setattr(ob.socket, 'gethostname', lambda: 'renamed-host')
+    monkeypatch.setenv('MESH_PUBLIC_URL', 'https://ambient.example')
+    def no_registration(*args, **kwargs):
+        pytest.fail('Reinstallation must not register another client')
+    monkeypatch.setattr(ob, 'request_json', no_registration)
+    assert ob.main(['pair', '--config-dir', str(tmp_path), '--no-browser']) == 0
+    assert (tmp_path / 'agent.env').read_text() == original
+    assert ob.main(['pair', '--config-dir', str(tmp_path), '--gateway', 'https://different.example', '--no-browser']) == 1
+    assert (tmp_path / 'agent.env').read_text() == original
